@@ -1,0 +1,352 @@
+//  Run a DXL Script on Selected Modules 
+
+/*
+
+	This script is from the Telelogic Kitchen and has
+	been modified by smartDXL.com.	
+
+	changes			Modified and tidied up for
+					conformance to coding standards.
+					Removed #includes.
+					Allow selection on module type.
+*/
+
+string promptOpts[]     = { "Yes", "Yes to all", "No", "Cancel" }
+string modeOpts[]       = { "Read only", "Edit" }
+string modTypeOptions[] = {"Formal", "Link"}
+string dummyList[]      = {}
+
+Project currProj        = null
+Module  currMod         = null
+bool    yesToAll        = false
+int     selectedModType = 0
+
+DB  dbRunAll       = null
+DBE dbeModuleList  = null
+DBE dbeIncludeFile = null
+DBE dbeDxlScript   = null
+DBE dbeModeOptions = null
+DBE dbeRun         = null
+DBE dbeSelectAll   = null
+DBE dbeClear       = null
+DBE selectedMods   = null
+DBE dbeModTypes    = null
+
+/************************************
+	fillModsList
+************************************/
+int fillModsList(DBE dbeList)
+{
+	int    i       = 0
+    int    len     = 0
+    string modName = ""
+    Item   it  
+
+    empty(dbeList)
+
+    for it in current Project do
+    {
+        modName = fullName(it)
+
+        if (null module modName)
+        {
+	        continue
+        }
+
+        if ((type module modName) != modTypeOptions[selectedModType])
+        {
+	        continue
+        }
+
+        insert(dbeList, i, modName)
+        i++
+    }
+
+    return noElems dbeList
+}
+
+/************************************
+	runScript
+************************************/
+bool runScript(string dxlScript, Module m)
+{
+    if (null m)
+    {
+	    return true
+    }
+
+    if (!yesToAll)
+    {
+        int ans = query("Run script on module '" fullName(m) "'?", promptOpts)
+
+        if ( promptOpts[ans] == "Cancel" )
+        {
+	        return false
+        }
+
+        if ( promptOpts[ans] == "No" )
+        {
+	        return true
+        }
+
+        if ( promptOpts[ans] == "Yes to all" )
+        {
+            yesToAll = true
+        }
+    }
+
+    Module oldCurr = current
+
+    (current ModuleRef__) = m
+
+    eval_(dxlScript)
+
+    if (!null oldCurr)
+    {
+	    (current ModuleRef__) = oldCurr
+    }
+
+    return true
+}
+
+/************************************
+	doSelect
+************************************/
+void doSelect(DBE dbe)
+{
+    int nm   = 0
+    string s = ""
+
+    for s in dbeModuleList do
+    {
+	    nm++
+    }
+
+    if ( nm == 0 )
+    {
+	    inactive dbeRun
+    }
+    else
+    {
+	    active dbeRun
+    }
+
+    set(selectedMods, nm "/" noElems(dbeModuleList) "")
+}
+
+/************************************
+	doRunScript
+************************************/
+void doRunScript(DB db)
+{
+    string incFile    = ""
+    string dxlText    = ""
+    string dxlScript  = ""
+    string res        = ""
+    Module thisMod    = null
+    bool   runOK      = true
+    string mn         = ""
+    bool   opened     = false
+    int    n          = 0
+
+    incFile = get(dbeIncludeFile)
+    dxlText = get(dbeDxlScript)
+
+    if (incFile == doorsHome "\\lib\\dxl")
+    {
+	    incFile = ""
+    }
+
+    if (incFile != "")
+    {
+    	Stat st = create(incFile)
+    	if ( null st )
+   	 	{
+        	warningBox "No such file '" incFile "'."
+        	return
+    	}
+
+    	if ( !regular(st) )
+    	{
+        	warningBox "The name '" incFile "' is not a file."
+        	return
+    	}
+	}
+
+	if (incFile != "")
+	{
+		dxlScript = "#include <" incFile ">\n"
+	}
+
+	dxlScript = dxlScript dxlText
+
+	res = checkDXL(dxlScript)
+
+	if (res != "")
+	{
+		warningBox("Errors in DXL:\n" res)
+		return
+	}
+
+    // get module mode
+    int mode = get(dbeModeOptions)
+
+    // count items
+    int numMods = 0
+    for mn in dbeModuleList do numMods++
+
+    progressStart(dbRunAll, "Running script on selected modules", "Initialising...", numMods)
+
+    yesToAll = false
+
+    for mn in dbeModuleList do
+    {
+        if (!runOK) break
+
+        opened = false
+
+        // open module
+        progressMessage("Opening module '" mn "' ...")
+
+        if (!open(module mn))
+        {
+	        opened = true
+        }
+
+        if (modeOpts[mode] == "Edit")
+        {
+	        thisMod = edit(mn, false)
+        }
+        else
+        {
+	        thisMod = read(mn, false)
+        }
+
+        if (null thisMod)
+        {
+	        infoBox("Failed to open module " mn)
+	        return
+        }
+
+        progressMessage("Running script on module '" mn "' ...")
+
+        runOK = runScript(dxlScript, thisMod)
+
+        progressStep(n++)
+
+        // save and close module
+        progressMessage("Closing module '" mn "' ...")
+
+        if (isEdit(thisMod)) save(thisMod)
+        if (opened) close(thisMod)
+    }
+
+    progressStop()
+
+}
+
+/************************************
+	doSelectModTypes
+************************************/
+void doSelectModTypes(DBE dbe)
+{
+	selectedModType = get(dbeModTypes)
+
+	fillModsList(dbeModuleList)
+}
+
+/************************************
+	doSelectIncPartners
+************************************/
+void doSelectIncPartners(DBE dbe)
+{
+	fillModsList(dbeModuleList)
+}
+
+/************************************
+	doSelectAllMods
+************************************/
+void doSelectAllMods(DBE dbe)
+{
+    int i
+    for i in 0:noElems(dbeModuleList)-1 do
+    {
+        set(dbeModuleList, i, true)
+    }
+
+    doSelect(dbeModuleList)
+}
+
+/************************************
+	doClearMods
+************************************/
+void doClearMods(DBE dbe)
+{
+    int i
+    for i in 0:noElems(dbeModuleList)-1 do
+    {
+        set(dbeModuleList, i, false)
+    }
+
+    doSelect(dbeModuleList)
+}
+
+/************************************
+	contextOK
+************************************/
+bool contextOk()
+{
+	currProj = current Project
+
+	if (null currProj)
+	{
+		infoBox("Please run this script from within a project")
+		return false
+	}
+
+	return true
+}
+
+/************************************
+	MAIN
+************************************/
+if (!contextOk)
+{
+	halt
+}
+
+dbRunAll = create("Run DXL script on selected modules")
+
+label(dbRunAll, "#include:")
+
+dbeIncludeFile = fileName(dbRunAll, doorsHome "\\lib\\dxl", "*.dxl;*.inc", "DXL files")
+
+dbeDxlScript   = text(dbRunAll, "DXL script:", "", 300, 100, false)
+dbeModeOptions = radioBox(dbRunAll, "Open modules in mode:", modeOpts, 0)
+
+dbeModTypes    = radioBox(dbRunAll, "Module Type: " , modTypeOptions, 0)
+
+dbeModuleList  = multiList(dbRunAll, "Formal modules:",     300, 10, dummyList)
+dbeSelectAll   = button(dbRunAll, "Select all", doSelectAllMods)
+
+beside(dbRunAll)
+dbeClear       = button(dbRunAll, "Clear", doClearMods)
+selectedMods   = field(dbRunAll, "# selected:", "", 4, true)
+
+left(dbRunAll)
+dbeRun     = apply(dbRunAll, "Run", doRunScript)
+
+realize dbRunAll
+
+inactive(dbeRun)
+
+set(dbeModuleList, doSelect, doSelect)
+set(dbeModTypes, doSelectModTypes)
+
+if (fillModsList(dbeModuleList) == 0)
+{
+    inactive dbeRun
+    insert(dbeModuleList, 0, "(No modules)")
+}
+
+block(dbRunAll)
