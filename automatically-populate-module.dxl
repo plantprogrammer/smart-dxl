@@ -1,0 +1,97 @@
+//  Populate a Requirements Module with objects
+
+/*
+    Populates the current module with a heading structure and
+    text objects. The heading structure is based on a requirements
+    specification. Objects are created below these headings in a reralistic
+    manner so that the resulting module is representative of a real module.
+
+    This function can be run repeatedly to insert more text objects into the
+    existing heading structure.
+
+    Tony Goodman.
+*/
+
+// you must #include file containing function getRandomText()
+
+Module srcModule = null
+
+/************************************
+	addHeaders
+
+	Add predefined header structure to the current module if and only if
+	the module is empty.
+************************************/
+void addHeaders()
+{
+	Object o = first(srcModule)
+
+	if (null o)
+	{
+		// add headers
+		instance srsTemplate
+	}
+}
+
+/************************************
+	addObjects
+
+	Add text objects to the current module.
+	Objects are added randomly.
+************************************/
+void addObjects()
+{
+	Object header  = null
+	Object o       = null
+	Skip   headers = create
+	int    numObjs = 0
+	int    count   = 0
+	int    i       = 0
+	int    a       = 0
+
+	for o in srcModule do
+	{
+		if (o."Object Heading" "" != "")
+		{
+			a = o."Absolute Number"
+			for (i = 0; i < level(o); i++)
+			{
+				numObjs++
+				put(headers, numObjs, a)
+			}
+		}
+	}
+
+	numObjs = numObjs * 5
+
+	for (count = 0; count < numObjs; count++)
+	{
+		i = random(numObjs) + 1
+
+		if (find(headers, i, a))
+		{
+			header = object(a, srcModule)
+
+			o = create(below(header))
+
+			o."Object Text" = getRandomText()
+		}
+	}
+}
+
+/************************************
+	MAIN
+************************************/
+srcModule = current Module
+
+if (null srcModule)
+{
+	infoBox("No current Module")
+	halt
+}
+
+hideExplorer(srcModule)
+
+addHeaders()
+
+addObjects()
