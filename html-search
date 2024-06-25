@@ -1,0 +1,39 @@
+Certainly! You can modify the script to filter files based on their creation date. Here’s an updated version of the script that only searches through HTML files created on a specific date:
+
+```powershell
+# Define the directory to start the search
+$directory = "C:\path\to\your\directory"
+
+# Define the string to search for
+$searchString = "your_search_string"
+
+# Define the specific date for filtering files (YYYY-MM-DD)
+$filterDate = Get-Date "2023-06-25"
+
+# Recursively get all HTML files in the directory and subdirectories
+$files = Get-ChildItem -Path $directory -Recurse -Filter "*.html" | Where-Object {
+    $_.CreationTime.Date -eq $filterDate.Date
+}
+
+# Loop through each file
+foreach ($file in $files) {
+    # Read the content of the file
+    $content = Get-Content -Path $file.FullName
+
+    # Check if the content contains the search string
+    if ($content -match $searchString) {
+        Write-Output "Found in file: $($file.FullName)"
+    }
+}
+```
+
+### Explanation:
+
+1. **Define the directory and search string**: Same as before.
+2. **Define the filter date**: The date for filtering files is defined using the `Get-Date` cmdlet. Replace `"2023-06-25"` with the desired date.
+3. **Get-ChildItem**: This cmdlet gets all HTML files in the specified directory and its subdirectories.
+4. **Where-Object**: This filters the files based on their creation date.
+5. **Loop through each file**: For each file that matches the date filter, the script reads the content and checks if it contains the search string.
+6. **Output the results**: If the search string is found in a file, the script outputs the file path.
+
+Make sure to replace `C:\path\to\your\directory` with the actual path of the directory you want to search, `your_search_string` with the string you're looking for, and `"2023-06-25"` with the desired date. Save this script in a `.ps1` file and run it using PowerShell.
