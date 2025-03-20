@@ -32,16 +32,16 @@ foreach ($Folder in $Folders) {
         $FilePath = $HtmlFile.FullName
         $HtmlContent = Get-Content -Path $FilePath -Raw
         
-        # Check if the table with the given class has any rows
-        if ($HtmlContent -match "<table[^>]*class=\"$TableClass\"[^>]*>.*?<\/table>") {
-            if ($HtmlContent -notmatch "<table[^>]*class=\"$TableClass\"[^>]*>.*?<tr.*?>.*?<\/tr>.*?<\/table>") {
-                Write-Output "Sending folder to Recycle Bin: $($Folder.FullName) (Empty table found in $($HtmlFile.Name))"
+        # Check if the table with the given class has a tbody and if tbody has any rows
+        if ($HtmlContent -match "<table[^>]*class=\"$TableClass\"[^>]*>.*?<tbody>.*?</tbody>.*?</table>") {
+            if ($HtmlContent -notmatch "<table[^>]*class=\"$TableClass\"[^>]*>.*?<tbody>.*?<tr.*?>.*?</tr>.*?</tbody>.*?</table>") {
+                Write-Output "Sending folder to Recycle Bin: $($Folder.FullName) (Empty tbody found in $($HtmlFile.Name))"
                 [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($Folder.FullName, 'OnlyErrorDialogs', 'SendToRecycleBin')
             } else {
-                Write-Output "Skipping folder: $($Folder.FullName) (Table contains rows in $($HtmlFile.Name))"
+                Write-Output "Skipping folder: $($Folder.FullName) (Tbody contains rows in $($HtmlFile.Name))"
             }
         } else {
-            Write-Output "Skipping folder: $($Folder.FullName) (Table not found in $($HtmlFile.Name))"
+            Write-Output "Skipping folder: $($Folder.FullName) (Table or tbody not found in $($HtmlFile.Name))"
         }
     } else {
         Write-Output "Skipping folder: $($Folder.FullName) (No HTML file found)"
