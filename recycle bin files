@@ -1,0 +1,49 @@
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName Microsoft.VisualBasic
+Add-Type -AssemblyName Microsoft.VisualBasic.FileIO
+
+# Create Open Folder Dialog
+$FolderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+$FolderBrowser.Description = "Select the Parent Directory"
+$null = $FolderBrowser.ShowDialog()
+$ParentDirectory = $FolderBrowser.SelectedPath
+
+if (-not $ParentDirectory) {
+    Write-Output "No directory selected. Exiting."
+    exit
+}
+
+# Create Input Box for Table Class
+$TableClass = [Microsoft.VisualBasic.Interaction]::InputBox("Enter the table class to check:", "Table Class", "target-table")
+
+if (-not $TableClass) {
+    Write-Output "No table class entered. Exiting."
+    exit
+}
+
+# Get all subdirectories
+$Folders = Get-ChildItem -Path $ParentDirectory -Directory
+
+foreach ($Folder in $Folders) {
+    # Find the first HTML file in the directory
+    $HtmlFile = Get-ChildItem -Path $Folder.FullName -Filter "*.html" | Select-Object -First 1
+    
+    if ($HtmlFile) {
+        $FilePath = $HtmlFile.FullName
+        $HtmlContent = Get-Content -Path $FilePath -Raw
+        
+        # Check if the table with the given class has any rows
+        if ($HtmlContent -match "<table[^>]*class=\"$TableClass\"[^>]*>.*?<\/table>") {
+            if ($HtmlContent -notmatch "<table[^>]*class=\"$TableClass\"[^>]*>.*?<tr.*?>.*?<\/tr>.*?<\/table>") {
+                Write-Output "Sending folder to Recycle Bin: $($Folder.FullName) (Empty table found in $($HtmlFile.Name))"
+                [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($Folder.FullName, 'OnlyErrorDialogs', 'SendToRecycleBin')
+            } else {
+                Write-Output "Skipping folder: $($Folder.FullName) (Table contains rows in $($HtmlFile.Name))"
+            }
+        } else {
+            Write-Output "Skipping folder: $($Folder.FullName) (Table not found in $($HtmlFile.Name))"
+        }
+    } else {
+        Write-Output "Skipping folder: $($Folder.FullName) (No HTML file found)"
+    }
+}
