@@ -1,0 +1,43 @@
+Add-Type -AssemblyName System.Windows.Forms
+
+# Create Open Folder Dialog
+$FolderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+$FolderBrowser.Description = "Select the Parent Directory"
+$null = $FolderBrowser.ShowDialog()
+$ParentDirectory = $FolderBrowser.SelectedPath
+
+if (-not $ParentDirectory) {
+    Write-Output "No directory selected. Exiting."
+    exit
+}
+
+# Create Input Box for Size Threshold
+$SizeThreshold = [Microsoft.VisualBasic.Interaction]::InputBox("Enter the file size threshold in bytes:", "Size Threshold", "1024")
+
+if (-not $SizeThreshold -match '^[0-9]+$') {
+    Write-Output "Invalid size threshold. Exiting."
+    exit
+}
+
+$SizeThreshold = [int]$SizeThreshold
+$TargetFile = "target.txt"  # Change this to the file you want to check
+
+# Get all subdirectories
+$Folders = Get-ChildItem -Path $ParentDirectory -Directory
+
+foreach ($Folder in $Folders) {
+    $FilePath = Join-Path -Path $Folder.FullName -ChildPath $TargetFile
+    
+    if (Test-Path $FilePath) {
+        $FileSize = (Get-Item $FilePath).Length
+        
+        if ($FileSize -lt $SizeThreshold) {
+            Write-Output "Deleting folder: $($Folder.FullName) (File size: $FileSize bytes)"
+            Remove-Item -Path $Folder.FullName -Recurse -Force
+        } else {
+            Write-Output "Skipping folder: $($Folder.FullName) (File size: $FileSize bytes)"
+        }
+    } else {
+        Write-Output "Skipping folder: $($Folder.FullName) (File not found)"
+    }
+}
