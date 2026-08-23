@@ -1,0 +1,807 @@
+/*
+================================================================================
+ align_project_baselines.dxl
+
+ PURPOSE
+   Compares two DOORS projects that are meant to be "the same project" (e.g.
+   two copies / branches / environments of one project tree) and aligns their
+   Baseline Set Definitions (BSDs) so that:
+
+     1. Both projects have the same set of named Baseline Set Definitions.
+     2. Each BSD contains the same member modules in both projects.
+     3. Each BSD has the same set of captured Baseline Set versions
+        (versionID) in both projects.
+
+   NEW IN THIS VERSION: a DXL dialog lets the admin manually MAP a Baseline
+   Set Definition in Project A to the corresponding (but possibly
+   differently-named) Baseline Set Definition in Project B, instead of
+   relying on the two names matching exactly. BSDs whose names match exactly
+   are pre-matched automatically as a starting point; the admin can remove or
+   change any of those, and add mappings for anything named differently.
+   Anything left unmapped when "Run Alignment" is clicked is treated as
+   genuinely new and is created fresh in the other project.
+
+ DOORS DATA MODEL USED (DXL 9.6/9.7 reference manual + community examples)
+   Folder                  - a Project is just a top-level Folder.
+   BaselineSetDefinition   - a named "recipe": which modules belong to a set.
+   BaselineSet             - one captured/versioned snapshot of a BSD
+                             (has a versionID, e.g. "1.0").
+   ModName_                - a lightweight reference to a module (by path),
+                             used with module()/addModule() so you do not
+                             have to open the module read/write.
+   ModuleVersion           - the frozen copy of a module inside a
+                             BaselineSet (has versionString/fullName).
+
+ !!! IMPORTANT SAFETY NOTES - READ BEFORE RUNNING !!!
+   - Baselines and Baseline Set captures are effectively permanent in DOORS;
+     ordinary users/admins cannot cleanly "undo" a capture. ALWAYS test this
+     against copies of the two projects (or a sandbox) before running it
+     against production projects.
+   - This script CANNOT recreate the historical content of a baseline that
+     was captured in the "ahead" project days/weeks/months ago. If a
+     Baseline Set version is missing from the "behind" project, the only
+     thing DXL can do is capture a NEW Baseline Set today, using whatever
+     content the behind project's modules currently contain. That new
+     capture is tagged with the same version label for structural
+     consistency, but it is NOT a byte-for-byte historical replica.
+     Because of this, creating missing captures is opt-in (see
+     CREATE_MISSING_BASELINE_SETS below) and off by default.
+   - Adding a module to a Baseline Set Definition's membership only works if
+     that module already exists (at the matching relative path) in the
+     target project. The script cannot create modules that don't exist yet;
+     it will log those as warnings for a human to resolve.
+   - The GUI calls below (create/label/list/field/apply/ok/close/get/insert/
+     delete/set/show/hide/destroy) are assembled from several independently
+     confirmed working DXL examples (DOORS DXL forum, jazz.net archive,
+     community blogs). The Baseline/BaselineSet/BaselineSetDefinition calls
+     are likewise reconstructed from the DXL reference manual's table of
+     contents plus working community examples, not a single verbatim source
+     I could fully re-verify page by page. Test on a sandbox project first,
+     and expect to nudge minor syntax if your exact 9.7.2 build differs.
+
+ CONFIGURE THE SECTION BELOW, THEN RUN FROM THE DXL EDITOR (Tools > Edit DXL)
+================================================================================
+*/
+
+// ------------------------------------------------------------------
+// CONFIGURATION - edit these before running
+// ------------------------------------------------------------------
+
+string PROJ_A_PATH = "/Project A"     // full DOORS path to first project
+string PROJ_B_PATH = "/Project B"     // full DOORS path to second project
+
+// Dry run by default. Set true only after you have reviewed the report
+// and are running against a test copy of the projects.
+bool APPLY_CHANGES = false
+
+// Even with APPLY_CHANGES = true, missing *captured* Baseline Set versions
+// are only created if this is also true (see the safety note above).
+bool CREATE_MISSING_BASELINE_SETS = false
+
+// Optional: also write the log to a text file. Leave "" to log to the
+// DXL output window only.
+string LOG_FILE_PATH = ""
+
+// ------------------------------------------------------------------
+// LOGGING
+// ------------------------------------------------------------------
+
+bool useLogFile_ = (LOG_FILE_PATH != "")
+Stream logStream_
+
+void openLog()
+{
+    if (useLogFile_)
+        logStream_ = write(LOG_FILE_PATH)
+}
+
+void log(string s)
+{
+    print s "\n"
+    if (useLogFile_)
+        logStream_ << s << "\n"
+}
+
+void closeLog()
+{
+    if (useLogFile_)
+        close(logStream_)
+}
+
+// ------------------------------------------------------------------
+// SMALL STRING / ARRAY HELPERS
+// ------------------------------------------------------------------
+
+// Returns the part of "full" that comes after the "prefix" characters.
+// Used to turn an absolute module path in one project into a path that is
+// relative to that project's root, so it can be compared against / rebuilt
+// under the other project's root.
+string stripPrefix(string full, string prefix)
+{
+    int lenPrefix = length(prefix)
+    int lenFull   = length(full)
+    string result = ""
+
+    if (lenFull <= lenPrefix)
+        return result
+
+    int i
+    for i in lenPrefix:lenFull-1 do
+        result = result full[i]
+
+    return result
+}
+
+bool arrayContains(string arr[], string val)
+{
+    if (sizeof(arr) == 0)
+        return false
+
+    int i
+    for i in 0:sizeof(arr)-1 do
+        if (arr[i] == val)
+            return true
+
+    return false
+}
+
+// ------------------------------------------------------------------
+// GLOBAL STATE FOR THE MAPPING DIALOG
+// ------------------------------------------------------------------
+
+Folder g_dlgProjA
+Folder g_dlgProjB
+string g_dlgRootA
+string g_dlgRootB
+
+// Parallel arrays: confirmed mapping i is (g_mapNameA[i] <-> g_mapNameB[i])
+string g_mapNameA[]
+string g_mapNameB[]
+
+// Mirrors of what is currently shown (unmapped) in each side's list widget
+string g_curA[]
+string g_curB[]
+
+DB  g_mapDlg
+DBE g_listA
+DBE g_listB
+DBE g_listMap
+DBE g_status
+
+// ------------------------------------------------------------------
+// ARRAY BOOKKEEPING HELPERS FOR THE MAPPING DIALOG
+// (operate directly on the globals above - see comments in the code
+//  for why these are not generic array-parameter functions)
+// ------------------------------------------------------------------
+
+void removeFromCurA(int idx)
+{
+    string result[]
+    int i
+    if (sizeof(g_curA) > 0)
+        for i in 0:sizeof(g_curA)-1 do
+            if (i != idx)
+                result[sizeof(result)] = g_curA[i]
+    g_curA = result
+}
+
+void removeFromCurB(int idx)
+{
+    string result[]
+    int i
+    if (sizeof(g_curB) > 0)
+        for i in 0:sizeof(g_curB)-1 do
+            if (i != idx)
+                result[sizeof(result)] = g_curB[i]
+    g_curB = result
+}
+
+void prependToCurA(string val)
+{
+    string result[]
+    result[0] = val
+    int i
+    if (sizeof(g_curA) > 0)
+        for i in 0:sizeof(g_curA)-1 do
+            result[sizeof(result)] = g_curA[i]
+    g_curA = result
+}
+
+void prependToCurB(string val)
+{
+    string result[]
+    result[0] = val
+    int i
+    if (sizeof(g_curB) > 0)
+        for i in 0:sizeof(g_curB)-1 do
+            result[sizeof(result)] = g_curB[i]
+    g_curB = result
+}
+
+void removeMappingAt(int idx)
+{
+    string newA[]
+    string newB[]
+    int i
+    if (sizeof(g_mapNameA) > 0)
+        for i in 0:sizeof(g_mapNameA)-1 do
+            if (i != idx)
+            {
+                newA[sizeof(newA)] = g_mapNameA[i]
+                newB[sizeof(newB)] = g_mapNameB[i]
+            }
+    g_mapNameA = newA
+    g_mapNameB = newB
+}
+
+// ------------------------------------------------------------------
+// BASELINE / BSD HELPERS
+// ------------------------------------------------------------------
+
+// Finds a BaselineSetDefinition by name inside a project (Folder).
+bool findBSDByName(Folder proj, string bsdName, BaselineSetDefinition &foundBsd)
+{
+    BaselineSetDefinition b
+    for b in proj do
+    {
+        if (name(b) == bsdName)
+        {
+            foundBsd = b
+            return true
+        }
+    }
+    return false
+}
+
+void collectBSDNames(Folder proj, string names[])
+{
+    BaselineSetDefinition b
+    for b in proj do
+        names[sizeof(names)] = name(b)
+}
+
+// Collects the relative (project-root-stripped) paths of every module
+// that is a member of the given BSD.
+void getMemberRelativePaths(BaselineSetDefinition bsd, string projRootFull, string relPaths[])
+{
+    ModName_ m
+    for m in bsd do
+        relPaths[sizeof(relPaths)] = stripPrefix(fullName(m), projRootFull)
+}
+
+// Collects the versionID of every BaselineSet captured under a BSD.
+void getCapturedVersions(BaselineSetDefinition bsd, string versions[])
+{
+    BaselineSet bs
+    for bs in bsd do
+        versions[sizeof(versions)] = versionID(bs)
+}
+
+int countCapturedBaselineSets(Folder proj)
+{
+    int total = 0
+    BaselineSetDefinition b
+    for b in proj do
+    {
+        BaselineSet bs
+        for bs in b do
+            total++
+    }
+    return total
+}
+
+// Adds one module (identified by its path relative to the target
+// project's root) to a BaselineSetDefinition's membership.
+void addMissingModule(string projRootFull, BaselineSetDefinition bsd, string relPath)
+{
+    string fullPath = projRootFull relPath
+    ModName_ m = module(fullPath)
+
+    if (null m)
+    {
+        log("    WARNING: no module found at \"" fullPath "\" - cannot add. "
+            "The module may not exist there yet; resolve manually.")
+        return
+    }
+
+    string err = addModule(m, bsd)
+    if (!null err)
+        log("    ERROR adding module \"" fullPath "\" to BSD \"" name(bsd) "\": " err)
+    else
+        log("    Added module \"" fullPath "\" to BSD \"" name(bsd) "\"")
+}
+
+// Creates a missing BaselineSetDefinition in the target project, copying
+// the description from the source project's BSD but keeping the name the
+// admin asked for (may differ from the source BSD's name).
+bool createMissingBSD(Folder targetProj, string bsdName, string bsdDesc, BaselineSetDefinition &outBsd)
+{
+    string err = create(targetProj, bsdName, bsdDesc, outBsd)
+    if (!null err)
+    {
+        log("  ERROR creating Baseline Set Definition \"" bsdName "\": " err)
+        return false
+    }
+    log("  Created Baseline Set Definition \"" bsdName "\" in " fullName(targetProj))
+    return true
+}
+
+// Captures a brand-new Baseline Set for the given BSD, using whatever
+// modules currently sit in it, tagged with the supplied version label.
+// See the safety note at the top of this file: this is NOT a historical
+// replica, it's a fresh capture taken right now.
+bool createBaselineSetCapture(BaselineSetDefinition bsd, string versionLabel, string desc)
+{
+    string err = lock(bsd)
+    if (!null err)
+    {
+        log("    ERROR locking BSD \"" name(bsd) "\" before capture: " err)
+        return false
+    }
+
+    Skip modList = create
+    int idx = 0
+    ModName_ m
+    for m in bsd do
+    {
+        put(modList, idx, m)
+        idx++
+    }
+
+    BaselineSet newBs
+    string createErr = create(bsd, true, versionLabel, desc, newBs)
+    unlock(bsd)
+
+    if (!null createErr)
+    {
+        log("    ERROR creating Baseline Set \"" versionLabel "\" for BSD \"" name(bsd) "\": " createErr)
+        return false
+    }
+
+    string addErr = addBaselines(modList, newBs)
+    if (!null addErr)
+        log("    WARNING while capturing modules into \"" versionLabel "\": " addErr)
+
+    close(newBs)
+    log("    Captured new Baseline Set \"" versionLabel "\" for BSD \"" name(bsd) "\" "
+        "(content reflects the target project's state right now, not the original baseline date).")
+    return true
+}
+
+// ------------------------------------------------------------------
+// ALIGNMENT ENGINE
+// (operates on one already-resolved pair of BSDs at a time; direction
+//  - which side is "ahead"/"behind" - is decided per pair by comparing
+//  how many Baseline Sets each side has already captured)
+// ------------------------------------------------------------------
+
+void alignOneDirection(BaselineSetDefinition refBsd, string refRoot,
+                        BaselineSetDefinition targetBsd, string targetRoot)
+{
+    string refMembers[]
+    getMemberRelativePaths(refBsd, refRoot, refMembers)
+    string targetMembers[]
+    getMemberRelativePaths(targetBsd, targetRoot, targetMembers)
+
+    string missingMembers[]
+    int i
+    if (sizeof(refMembers) > 0)
+        for i in 0:sizeof(refMembers)-1 do
+            if (!arrayContains(targetMembers, refMembers[i]))
+                missingMembers[sizeof(missingMembers)] = refMembers[i]
+
+    if (sizeof(missingMembers) > 0)
+    {
+        log("  " sizeof(missingMembers) " module(s) missing from target BSD membership:")
+        for i in 0:sizeof(missingMembers)-1 do
+            log("    - " missingMembers[i])
+
+        if (APPLY_CHANGES)
+        {
+            string lockErr = lock(targetBsd)
+            if (null lockErr)
+            {
+                for i in 0:sizeof(missingMembers)-1 do
+                    addMissingModule(targetRoot, targetBsd, missingMembers[i])
+                save(targetBsd)
+                unlock(targetBsd)
+            }
+            else
+                log("  ERROR locking target BSD for membership update: " lockErr)
+        }
+        else
+            log("  (dry run - set APPLY_CHANGES = true to add these)")
+    }
+    else
+        log("  Module membership already aligned.")
+
+    string refVersions[]
+    getCapturedVersions(refBsd, refVersions)
+    string targetVersions[]
+    getCapturedVersions(targetBsd, targetVersions)
+
+    string missingVersions[]
+    if (sizeof(refVersions) > 0)
+        for i in 0:sizeof(refVersions)-1 do
+            if (!arrayContains(targetVersions, refVersions[i]))
+                missingVersions[sizeof(missingVersions)] = refVersions[i]
+
+    if (sizeof(missingVersions) > 0)
+    {
+        log("  " sizeof(missingVersions) " Baseline Set version(s) captured on the reference side but not on the target side:")
+        for i in 0:sizeof(missingVersions)-1 do
+            log("    - " missingVersions[i])
+
+        if (APPLY_CHANGES && CREATE_MISSING_BASELINE_SETS)
+        {
+            for i in 0:sizeof(missingVersions)-1 do
+            {
+                string desc = ""
+                BaselineSet matchBs
+                for matchBs in refBsd do
+                    if (versionID(matchBs) == missingVersions[i])
+                        desc = description(matchBs)
+
+                string note = desc " [structurally synced by align_project_baselines.dxl - "
+                               "content captured at sync time, not the original baseline date]"
+                createBaselineSetCapture(targetBsd, missingVersions[i], note)
+            }
+        }
+        else
+            log("    (not created - set APPLY_CHANGES = true AND CREATE_MISSING_BASELINE_SETS = true to capture these now)")
+    }
+    else
+        log("  Captured Baseline Set versions already aligned.")
+}
+
+// Aligns one confirmed pair of BSDs (bsdNameA in projA <-> bsdNameB in
+// projB), choosing direction by whichever side has captured fewer
+// Baseline Sets so far for that pair.
+void alignPair(Folder projA, string rootA, string bsdNameA,
+               Folder projB, string rootB, string bsdNameB)
+{
+    BaselineSetDefinition bsdA
+    BaselineSetDefinition bsdB
+    bool foundA = findBSDByName(projA, bsdNameA, bsdA)
+    bool foundB = findBSDByName(projB, bsdNameB, bsdB)
+
+    if (!foundA || !foundB)
+    {
+        log("  ERROR: could not re-locate mapped BSD \"" bsdNameA "\" <-> \"" bsdNameB "\" - skipping.")
+        return
+    }
+
+    int countA = 0
+    BaselineSet tmpBs
+    for tmpBs in bsdA do
+        countA++
+    int countB = 0
+    for tmpBs in bsdB do
+        countB++
+
+    log("")
+    log("BSD pair: \"" bsdNameA "\" (Project A, " countA " captured set(s)) <-> \""
+        bsdNameB "\" (Project B, " countB " captured set(s))")
+
+    if (countA >= countB)
+        alignOneDirection(bsdA, rootA, bsdB, rootB)
+    else
+        alignOneDirection(bsdB, rootB, bsdA, rootA)
+}
+
+// Handles a BSD that only exists on one side: creates a same-named BSD in
+// the other project, mirrors its membership, and (optionally) its
+// captured Baseline Set versions.
+void createFreshBSDCopy(Folder sourceProj, string sourceRoot, string bsdName,
+                         Folder destProj, string destRoot)
+{
+    log("")
+    log("BSD \"" bsdName "\" exists only in \"" fullName(sourceProj) "\".")
+
+    if (!APPLY_CHANGES)
+    {
+        log("  (dry run - set APPLY_CHANGES = true to create a matching BSD in \"" fullName(destProj) "\")")
+        return
+    }
+
+    BaselineSetDefinition sourceBsd
+    if (!findBSDByName(sourceProj, bsdName, sourceBsd))
+    {
+        log("  ERROR: could not re-locate BSD \"" bsdName "\" in source project - skipping.")
+        return
+    }
+
+    BaselineSetDefinition newBsd
+    if (!createMissingBSD(destProj, bsdName, description(sourceBsd), newBsd))
+        return
+
+    string sourceMembers[]
+    getMemberRelativePaths(sourceBsd, sourceRoot, sourceMembers)
+
+    if (sizeof(sourceMembers) > 0)
+    {
+        string lockErr = lock(newBsd)
+        if (null lockErr)
+        {
+            int i
+            for i in 0:sizeof(sourceMembers)-1 do
+                addMissingModule(destRoot, newBsd, sourceMembers[i])
+            save(newBsd)
+            unlock(newBsd)
+        }
+        else
+            log("  ERROR locking newly created BSD: " lockErr)
+    }
+
+    if (CREATE_MISSING_BASELINE_SETS)
+    {
+        string versions[]
+        getCapturedVersions(sourceBsd, versions)
+        if (sizeof(versions) > 0)
+        {
+            int i
+            for i in 0:sizeof(versions)-1 do
+            {
+                string desc = ""
+                BaselineSet matchBs
+                for matchBs in sourceBsd do
+                    if (versionID(matchBs) == versions[i])
+                        desc = description(matchBs)
+                string note = desc " [structurally synced by align_project_baselines.dxl]"
+                createBaselineSetCapture(newBsd, versions[i], note)
+            }
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// MAPPING DIALOG CALLBACKS
+// ------------------------------------------------------------------
+
+void cbAddMapping(DB d)
+{
+    int i = get(g_listA)
+    int j = get(g_listB)
+
+    if (i < 0 || j < 0)
+    {
+        set(g_status, "Select one item in BOTH lists before mapping.")
+        return
+    }
+
+    string nameA = get(g_listA, i)
+    string nameB = get(g_listB, j)
+
+    g_mapNameA[sizeof(g_mapNameA)] = nameA
+    g_mapNameB[sizeof(g_mapNameB)] = nameB
+    insert(g_listMap, sizeof(g_mapNameA)-1, nameA " -> " nameB)
+
+    delete(g_listA, i)
+    delete(g_listB, j)
+    removeFromCurA(i)
+    removeFromCurB(j)
+
+    set(g_status, "Mapped \"" nameA "\" -> \"" nameB "\".")
+}
+
+void cbRemoveMapping(DB d)
+{
+    int k = get(g_listMap)
+    if (k < 0)
+    {
+        set(g_status, "Select a confirmed mapping to remove first.")
+        return
+    }
+
+    string nameA = g_mapNameA[k]
+    string nameB = g_mapNameB[k]
+
+    insert(g_listA, 0, nameA)
+    insert(g_listB, 0, nameB)
+    prependToCurA(nameA)
+    prependToCurB(nameB)
+
+    delete(g_listMap, k)
+    removeMappingAt(k)
+
+    set(g_status, "Removed mapping for \"" nameA "\" - it is back in the unmapped lists.")
+}
+
+void cbRunAlignment(DB d)
+{
+    hide(d)
+    destroy(d)
+
+    log("")
+    log("================================================================")
+    log("User confirmed BSD mapping - proceeding with alignment.")
+    log("================================================================")
+
+    int i
+
+    log("Confirmed name mappings (Project A <-> Project B):")
+    if (sizeof(g_mapNameA) > 0)
+        for i in 0:sizeof(g_mapNameA)-1 do
+            log("  \"" g_mapNameA[i] "\" <-> \"" g_mapNameB[i] "\"")
+    else
+        log("  (none)")
+
+    if (sizeof(g_curA) > 0)
+    {
+        log("BSDs left unmapped in Project A:")
+        for i in 0:sizeof(g_curA)-1 do
+            log("  \"" g_curA[i] "\"")
+    }
+    if (sizeof(g_curB) > 0)
+    {
+        log("BSDs left unmapped in Project B:")
+        for i in 0:sizeof(g_curB)-1 do
+            log("  \"" g_curB[i] "\"")
+    }
+
+    // 1. process confirmed pairs (exists on both sides, possibly different names)
+    if (sizeof(g_mapNameA) > 0)
+        for i in 0:sizeof(g_mapNameA)-1 do
+            alignPair(g_dlgProjA, g_dlgRootA, g_mapNameA[i], g_dlgProjB, g_dlgRootB, g_mapNameB[i])
+
+    // 2. A-only leftovers -> create fresh in B
+    if (sizeof(g_curA) > 0)
+        for i in 0:sizeof(g_curA)-1 do
+            createFreshBSDCopy(g_dlgProjA, g_dlgRootA, g_curA[i], g_dlgProjB, g_dlgRootB)
+
+    // 3. B-only leftovers -> create fresh in A
+    if (sizeof(g_curB) > 0)
+        for i in 0:sizeof(g_curB)-1 do
+            createFreshBSDCopy(g_dlgProjB, g_dlgRootB, g_curB[i], g_dlgProjA, g_dlgRootA)
+
+    log("")
+    log("Alignment run complete.")
+    closeLog()
+}
+
+void cbCancelMapping(DB d)
+{
+    hide(d)
+    destroy(d)
+    log("")
+    log("User cancelled at the mapping dialog. No changes made.")
+    closeLog()
+}
+
+// ------------------------------------------------------------------
+// MAPPING DIALOG BUILDER
+// ------------------------------------------------------------------
+
+void showMappingDialog(Folder projA, string rootA, Folder projB, string rootB)
+{
+    g_dlgProjA = projA
+    g_dlgRootA = rootA
+    g_dlgProjB = projB
+    g_dlgRootB = rootB
+
+    string namesA[]
+    string namesB[]
+    collectBSDNames(projA, namesA)
+    collectBSDNames(projB, namesB)
+
+    string blank[]
+    g_mapNameA = blank
+    g_mapNameB = blank
+
+    string remainA[]
+    string remainB[]
+
+    int i
+    if (sizeof(namesA) > 0)
+    {
+        for i in 0:sizeof(namesA)-1 do
+        {
+            if (arrayContains(namesB, namesA[i]))
+            {
+                g_mapNameA[sizeof(g_mapNameA)] = namesA[i]
+                g_mapNameB[sizeof(g_mapNameB)] = namesA[i]
+            }
+            else
+                remainA[sizeof(remainA)] = namesA[i]
+        }
+    }
+    if (sizeof(namesB) > 0)
+    {
+        for i in 0:sizeof(namesB)-1 do
+            if (!arrayContains(namesA, namesB[i]))
+                remainB[sizeof(remainB)] = namesB[i]
+    }
+
+    g_curA = remainA
+    g_curB = remainB
+
+    string initialMapDisplay[]
+    if (sizeof(g_mapNameA) > 0)
+        for i in 0:sizeof(g_mapNameA)-1 do
+            initialMapDisplay[sizeof(initialMapDisplay)] = g_mapNameA[i] " -> " g_mapNameB[i]
+
+    log("Baseline Set Definitions found - Project A: " sizeof(namesA) "   Project B: " sizeof(namesB))
+    log("Exact-name matches pre-mapped automatically: " sizeof(g_mapNameA))
+
+    g_mapDlg = create("Map Baseline Set Definitions")
+
+    label(g_mapDlg, "Project A: " rootA)
+    g_listA = list(g_mapDlg, "Unmapped Baseline Set Definitions in A", 10, remainA)
+
+    label(g_mapDlg, "Project B: " rootB)
+    g_listB = list(g_mapDlg, "Unmapped Baseline Set Definitions in B", 10, remainB)
+
+    apply(g_mapDlg, "Map Selected Pair ->", cbAddMapping)
+    apply(g_mapDlg, "Remove Selected Mapping", cbRemoveMapping)
+
+    label(g_mapDlg, "Confirmed mappings (identical names were pre-matched automatically):")
+    g_listMap = list(g_mapDlg, "Confirmed mappings (A -> B)", 10, initialMapDisplay)
+
+    g_status = field(g_mapDlg, "Status",
+        "Select one BSD on each side, then click \"Map Selected Pair ->\". "
+        "Anything left unmapped when you click \"Run Alignment\" will be "
+        "created fresh in the other project.", 70, false)
+
+    ok(g_mapDlg, "Run Alignment", cbRunAlignment)
+    ok(g_mapDlg, "Cancel", cbCancelMapping)
+    close(g_mapDlg, false, cbCancelMapping)
+
+    show(g_mapDlg)
+}
+
+// ------------------------------------------------------------------
+// MAIN
+// ------------------------------------------------------------------
+
+void main()
+{
+    openLog()
+
+    log("================================================================")
+    log("Baseline alignment run")
+    log("  Project A: " PROJ_A_PATH)
+    log("  Project B: " PROJ_B_PATH)
+    log("  APPLY_CHANGES=" (APPLY_CHANGES ? "true" : "false")
+        "  CREATE_MISSING_BASELINE_SETS=" (CREATE_MISSING_BASELINE_SETS ? "true" : "false"))
+    log("================================================================")
+
+    Folder projA = folder(PROJ_A_PATH)
+    Folder projB = folder(PROJ_B_PATH)
+
+    if (null projA)
+    {
+        log("ERROR: could not open project at \"" PROJ_A_PATH "\"")
+        closeLog()
+        return
+    }
+    if (null projB)
+    {
+        log("ERROR: could not open project at \"" PROJ_B_PATH "\"")
+        closeLog()
+        return
+    }
+
+    log("Total captured Baseline Sets right now - Project A: " countCapturedBaselineSets(projA)
+        "   Project B: " countCapturedBaselineSets(projB))
+
+    if (APPLY_CHANGES)
+    {
+        if (!confirm("APPLY_CHANGES is ON.\n\nAfter you confirm the Baseline Set Definition "
+                      "mapping in the next dialog, this script may create Baseline Set "
+                      "Definitions, change their module membership, and (if enabled) capture "
+                      "new Baseline Sets in:\n  " PROJ_A_PATH "\nand/or\n  " PROJ_B_PATH "\n\n"
+                      "These actions are effectively permanent. Continue?"))
+        {
+            log("User cancelled before the mapping dialog was shown.")
+            closeLog()
+            return
+        }
+    }
+
+    showMappingDialog(projA, PROJ_A_PATH, projB, PROJ_B_PATH)
+    // Execution continues asynchronously from here: the rest of the
+    // workflow happens inside cbRunAlignment / cbCancelMapping once the
+    // user interacts with the dialog shown above.
+}
+
+main()
