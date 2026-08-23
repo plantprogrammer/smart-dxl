@@ -1,0 +1,465 @@
+/*
+================================================================================
+ align_project_baselines.dxl
+
+ PURPOSE
+   Compares two DOORS projects that are meant to be "the same project" (e.g.
+   two copies / branches / environments of one project tree) and aligns their
+   Baseline Set Definitions (BSDs) so that:
+
+     1. Both projects have the same set of named Baseline Set Definitions.
+     2. Each BSD contains the same member modules in both projects.
+     3. Each BSD has the same set of captured Baseline Set versions
+        (versionID) in both projects.
+
+   The project with FEWER captured baseline sets for a given BSD is treated
+   as "behind" and is the one that gets aligned to match the other.
+
+ DOORS DATA MODEL USED (DXL 9.6/9.7 reference manual + community examples)
+   Folder                  - a Project is just a top-level Folder.
+   BaselineSetDefinition   - a named "recipe": which modules belong to a set.
+   BaselineSet             - one captured/versioned snapshot of a BSD
+                             (has a versionID, e.g. "1.0").
+   ModName_                - a lightweight reference to a module (by path),
+                             used with module()/addModule() so you do not
+                             have to open the module read/write.
+   ModuleVersion           - the frozen copy of a module inside a
+                             BaselineSet (has versionString/fullName).
+
+ !!! IMPORTANT SAFETY NOTES - READ BEFORE RUNNING !!!
+   - Baselines and Baseline Set captures are effectively permanent in DOORS;
+     ordinary users/admins cannot cleanly "undo" a capture. ALWAYS test this
+     against copies of the two projects (or a sandbox) before running it
+     against production projects.
+   - This script CANNOT recreate the historical content of a baseline that
+     was captured in the "ahead" project days/weeks/months ago. If a
+     Baseline Set version is missing from the "behind" project, the only
+     thing DXL can do is capture a NEW Baseline Set today, using whatever
+     content the behind project's modules currently contain. That new
+     capture is tagged with the same version label for structural
+     consistency, but it is NOT a byte-for-byte historical replica.
+     Because of this, creating missing captures is opt-in (see
+     CREATE_MISSING_BASELINE_SETS below) and off by default.
+   - Adding a module to a Baseline Set Definition's membership only works if
+     that module already exists (at the matching relative path) in the
+     target project. The script cannot create modules that don't exist yet;
+     it will log those as warnings for a human to resolve.
+   - Some of the exact built-in parameter meanings below (in particular the
+     argument order of the create() overload used to capture a BaselineSet)
+     are reconstructed from a working community example rather than a
+     verbatim manual excerpt, because IBM's DXL reference manual is not a
+     browsable API index. Validate on a test project before trusting output.
+
+ CONFIGURE THE SECTION BELOW, THEN RUN FROM THE DXL EDITOR (Tools > Edit DXL)
+================================================================================
+*/
+
+// ------------------------------------------------------------------
+// CONFIGURATION - edit these before running
+// ------------------------------------------------------------------
+
+string PROJ_A_PATH = "/Project A"     // full DOORS path to first project
+string PROJ_B_PATH = "/Project B"     // full DOORS path to second project
+
+// Dry run by default. Set true only after you have reviewed the report
+// and are running against a test copy of the projects.
+bool APPLY_CHANGES = false
+
+// Even with APPLY_CHANGES = true, missing *captured* Baseline Set versions
+// are only created if this is also true (see the safety note above).
+bool CREATE_MISSING_BASELINE_SETS = false
+
+// Optional: also write the log to a text file. Leave "" to log to the
+// DXL output window only.
+string LOG_FILE_PATH = ""
+
+// ------------------------------------------------------------------
+// LOGGING
+// ------------------------------------------------------------------
+
+bool useLogFile_ = (LOG_FILE_PATH != "")
+Stream logStream_
+
+void openLog()
+{
+    if (useLogFile_)
+        logStream_ = write(LOG_FILE_PATH)
+}
+
+void log(string s)
+{
+    print s "\n"
+    if (useLogFile_)
+        logStream_ << s << "\n"
+}
+
+void closeLog()
+{
+    if (useLogFile_)
+        close(logStream_)
+}
+
+// ------------------------------------------------------------------
+// SMALL STRING / ARRAY HELPERS
+// ------------------------------------------------------------------
+
+// Returns the part of "full" that comes after the "prefix" characters.
+// Used to turn an absolute module path in one project into a path that is
+// relative to that project's root, so it can be compared against / rebuilt
+// under the other project's root.
+string stripPrefix(string full, string prefix)
+{
+    int lenPrefix = length(prefix)
+    int lenFull   = length(full)
+    string result = ""
+
+    if (lenFull <= lenPrefix)
+        return result
+
+    int i
+    for i in lenPrefix:lenFull-1 do
+        result = result full[i]
+
+    return result
+}
+
+bool arrayContains(string arr[], string val)
+{
+    if (sizeof(arr) == 0)
+        return false
+
+    int i
+    for i in 0:sizeof(arr)-1 do
+        if (arr[i] == val)
+            return true
+
+    return false
+}
+
+// ------------------------------------------------------------------
+// BASELINE / BSD HELPERS
+// ------------------------------------------------------------------
+
+// Finds a BaselineSetDefinition by name inside a project (Folder).
+bool findBSDByName(Folder proj, string bsdName, BaselineSetDefinition &foundBsd)
+{
+    BaselineSetDefinition b
+    for b in proj do
+    {
+        if (name(b) == bsdName)
+        {
+            foundBsd = b
+            return true
+        }
+    }
+    return false
+}
+
+// Collects the relative (project-root-stripped) paths of every module
+// that is a member of the given BSD.
+void getMemberRelativePaths(BaselineSetDefinition bsd, string projRootFull, string relPaths[])
+{
+    ModName_ m
+    for m in bsd do
+        relPaths[sizeof(relPaths)] = stripPrefix(fullName(m), projRootFull)
+}
+
+// Collects the versionID of every BaselineSet captured under a BSD.
+void getCapturedVersions(BaselineSetDefinition bsd, string versions[])
+{
+    BaselineSet bs
+    for bs in bsd do
+        versions[sizeof(versions)] = versionID(bs)
+}
+
+int countCapturedBaselineSets(Folder proj)
+{
+    int total = 0
+    BaselineSetDefinition b
+    for b in proj do
+    {
+        BaselineSet bs
+        for bs in b do
+            total++
+    }
+    return total
+}
+
+// Adds one module (identified by its path relative to the target
+// project's root) to a BaselineSetDefinition's membership.
+void addMissingModule(string projRootFull, BaselineSetDefinition bsd, string relPath)
+{
+    string fullPath = projRootFull relPath
+    ModName_ m = module(fullPath)
+
+    if (null m)
+    {
+        log("    WARNING: no module found at \"" fullPath "\" in target project - cannot add. "
+            "The module may not have been created there yet; resolve manually.")
+        return
+    }
+
+    string err = addModule(m, bsd)
+    if (!null err)
+        log("    ERROR adding module \"" fullPath "\" to BSD \"" name(bsd) "\": " err)
+    else
+        log("    Added module \"" fullPath "\" to BSD \"" name(bsd) "\"")
+}
+
+// Creates a missing BaselineSetDefinition in the target project, copying
+// the name/description from the reference project's BSD.
+bool createMissingBSD(Folder targetProj, string bsdName, string bsdDesc, BaselineSetDefinition &outBsd)
+{
+    string err = create(targetProj, bsdName, bsdDesc, outBsd)
+    if (!null err)
+    {
+        log("  ERROR creating Baseline Set Definition \"" bsdName "\": " err)
+        return false
+    }
+    log("  Created Baseline Set Definition \"" bsdName "\" in " fullName(targetProj))
+    return true
+}
+
+// Captures a brand-new Baseline Set for the given BSD, using whatever
+// modules currently sit in it, tagged with the supplied version label.
+// See the safety note at the top of this file: this is NOT a historical
+// replica, it's a fresh capture taken right now.
+bool createBaselineSetCapture(BaselineSetDefinition bsd, string versionLabel, string desc)
+{
+    string err = lock(bsd)
+    if (!null err)
+    {
+        log("    ERROR locking BSD \"" name(bsd) "\" before capture: " err)
+        return false
+    }
+
+    Skip modList = create
+    int idx = 0
+    ModName_ m
+    for m in bsd do
+    {
+        put(modList, idx, m)
+        idx++
+    }
+
+    BaselineSet newBs
+    string createErr = create(bsd, true, versionLabel, desc, newBs)
+    unlock(bsd)
+
+    if (!null createErr)
+    {
+        log("    ERROR creating Baseline Set \"" versionLabel "\" for BSD \"" name(bsd) "\": " createErr)
+        return false
+    }
+
+    string addErr = addBaselines(modList, newBs)
+    if (!null addErr)
+        log("    WARNING while capturing modules into \"" versionLabel "\": " addErr)
+
+    close(newBs)
+    log("    Captured new Baseline Set \"" versionLabel "\" for BSD \"" name(bsd) "\" "
+        "(content reflects the target project's state right now, not the original baseline date).")
+    return true
+}
+
+// ------------------------------------------------------------------
+// CORE ALIGNMENT: bring targetProj's BSDs in line with refProj's
+// ------------------------------------------------------------------
+
+void alignBSDs(Folder refProj, string refRoot, Folder targetProj, string targetRoot)
+{
+    log("")
+    log("Aligning \"" fullName(targetProj) "\" to match \"" fullName(refProj) "\"")
+    log("--------------------------------------------------------------")
+
+    BaselineSetDefinition refBsd
+    for refBsd in refProj do
+    {
+        string bsdName = name(refBsd)
+        log("BSD: \"" bsdName "\"")
+
+        BaselineSetDefinition targetBsd
+        bool found = findBSDByName(targetProj, bsdName, targetBsd)
+
+        if (!found)
+        {
+            log("  Missing entirely in target project.")
+            if (!APPLY_CHANGES)
+            {
+                log("  (dry run - re-run with APPLY_CHANGES = true to create it)")
+                continue
+            }
+            if (!createMissingBSD(targetProj, bsdName, description(refBsd), targetBsd))
+                continue
+        }
+
+        // ---- 1. align member-module lists ----
+        string refMembers[]
+        getMemberRelativePaths(refBsd, refRoot, refMembers)
+
+        string targetMembers[]
+        getMemberRelativePaths(targetBsd, targetRoot, targetMembers)
+
+        string missingMembers[]
+        int i
+        if (sizeof(refMembers) > 0)
+        {
+            for i in 0:sizeof(refMembers)-1 do
+                if (!arrayContains(targetMembers, refMembers[i]))
+                    missingMembers[sizeof(missingMembers)] = refMembers[i]
+        }
+
+        if (sizeof(missingMembers) > 0)
+        {
+            log("  " sizeof(missingMembers) " module(s) present in reference BSD but missing from target BSD:")
+            for i in 0:sizeof(missingMembers)-1 do
+                log("    - " missingMembers[i])
+
+            if (APPLY_CHANGES)
+            {
+                string lockErr = lock(targetBsd)
+                if (null lockErr)
+                {
+                    for i in 0:sizeof(missingMembers)-1 do
+                        addMissingModule(targetRoot, targetBsd, missingMembers[i])
+                    save(targetBsd)
+                    unlock(targetBsd)
+                }
+                else
+                {
+                    log("  ERROR locking target BSD for membership update: " lockErr)
+                }
+            }
+            else
+            {
+                log("  (dry run - re-run with APPLY_CHANGES = true to add these)")
+            }
+        }
+        else
+        {
+            log("  Module membership already aligned.")
+        }
+
+        // ---- 2. align captured Baseline Set versions ----
+        string refVersions[]
+        getCapturedVersions(refBsd, refVersions)
+
+        string targetVersions[]
+        getCapturedVersions(targetBsd, targetVersions)
+
+        string missingVersions[]
+        if (sizeof(refVersions) > 0)
+        {
+            for i in 0:sizeof(refVersions)-1 do
+                if (!arrayContains(targetVersions, refVersions[i]))
+                    missingVersions[sizeof(missingVersions)] = refVersions[i]
+        }
+
+        if (sizeof(missingVersions) > 0)
+        {
+            log("  " sizeof(missingVersions) " Baseline Set version(s) captured in reference project but not in target:")
+            for i in 0:sizeof(missingVersions)-1 do
+                log("    - " missingVersions[i])
+
+            if (APPLY_CHANGES && CREATE_MISSING_BASELINE_SETS)
+            {
+                for i in 0:sizeof(missingVersions)-1 do
+                {
+                    string desc = ""
+                    BaselineSet matchRbs
+                    for matchRbs in refBsd do
+                        if (versionID(matchRbs) == missingVersions[i])
+                            desc = description(matchRbs)
+
+                    string note = desc " [structurally synced by align_project_baselines.dxl - "
+                                   "content captured at sync time, not the original baseline date]"
+                    createBaselineSetCapture(targetBsd, missingVersions[i], note)
+                }
+            }
+            else
+            {
+                log("    (not created - set APPLY_CHANGES = true AND CREATE_MISSING_BASELINE_SETS = true "
+                    "to capture these now. Read the safety note at the top of this file first.)")
+            }
+        }
+        else
+        {
+            log("  Captured Baseline Set versions already aligned.")
+        }
+    }
+}
+
+// ------------------------------------------------------------------
+// MAIN
+// ------------------------------------------------------------------
+
+void main()
+{
+    openLog()
+
+    log("================================================================")
+    log("Baseline alignment run")
+    log("  Project A: " PROJ_A_PATH)
+    log("  Project B: " PROJ_B_PATH)
+    log("  APPLY_CHANGES=" (APPLY_CHANGES ? "true" : "false")
+        "  CREATE_MISSING_BASELINE_SETS=" (CREATE_MISSING_BASELINE_SETS ? "true" : "false"))
+    log("================================================================")
+
+    Folder projA = folder(PROJ_A_PATH)
+    Folder projB = folder(PROJ_B_PATH)
+
+    if (null projA)
+    {
+        log("ERROR: could not open project at \"" PROJ_A_PATH "\"")
+        closeLog()
+        return
+    }
+    if (null projB)
+    {
+        log("ERROR: could not open project at \"" PROJ_B_PATH "\"")
+        closeLog()
+        return
+    }
+
+    if (APPLY_CHANGES)
+    {
+        if (!confirm("APPLY_CHANGES is ON.\n\nThis script may create Baseline Set "
+                      "Definitions, change their module membership, and (if enabled) "
+                      "capture new Baseline Sets in:\n  " PROJ_A_PATH "\nand/or\n  "
+                      PROJ_B_PATH "\n\nThese actions are effectively permanent. "
+                      "Continue?"))
+        {
+            log("User cancelled before making changes.")
+            closeLog()
+            return
+        }
+    }
+
+    int countA = countCapturedBaselineSets(projA)
+    int countB = countCapturedBaselineSets(projB)
+
+    log("Total captured Baseline Sets - Project A: " countA "   Project B: " countB)
+
+    if (countA == countB)
+    {
+        log("Counts are equal overall; checking direction on a per-BSD basis in both directions.")
+        alignBSDs(projA, PROJ_A_PATH, projB, PROJ_B_PATH)
+        alignBSDs(projB, PROJ_B_PATH, projA, PROJ_A_PATH)
+    }
+    else if (countA > countB)
+    {
+        log("Project A is ahead overall.")
+        alignBSDs(projA, PROJ_A_PATH, projB, PROJ_B_PATH)
+    }
+    else
+    {
+        log("Project B is ahead overall.")
+        alignBSDs(projB, PROJ_B_PATH, projA, PROJ_A_PATH)
+    }
+
+    log("")
+    log("Run complete.")
+    closeLog()
+}
+
+main()
