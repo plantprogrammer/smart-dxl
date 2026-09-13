@@ -1,23 +1,10 @@
-// =========================================================================
-// HIGH-VOLUME HTML TO PDF CONVERTER (HDOC-FREE & RECYCLING ENABLED)
-// =========================================================================
+string MACRO_DOC_PATH = "C:\\Path\\To\\YourMacroDoc.docm" // Path to your macro file
+OleAutoObj objMacroDoc = null
 
-OleAutoObj hWord = null
-OleAutoObj hDocs = null
-
-// --- GLOBAL CONFIGURATION ---
-const int BATCH_RECYCLE_LIMIT = 15 // Restart Word every 15 files to clear memory leaks
-int docCounter = 0
-
-// Target file arrays (Populate with your file paths)
-string htmlFiles[] = { "C:\\Docs\\file1.html", "C:\\Docs\\file2.html", "C:\\Docs\\file3.html" }
-string pdfFiles[]  = { "C:\\PDFs\\file1.pdf",  "C:\\PDFs\\file2.pdf",  "C:\\PDFs\\file3.pdf"  }
-int totalFiles = sizeof(htmlFiles)
-
-// --- HELPER FUNCTION: LAUNCH / RESTART WORD ---
 bool startWordInstance() {
-    // Safely cleanup old handles if they exist
-    if (!null hDocs) { oleCloseAutoObject(hDocs); hDocs = null }
+    // 1. Clean up existing objects
+    if (!null objMacroDoc) { oleCloseAutoObject(objMacroDoc); objMacroDoc = null }
+    if (!null hDocs)       { oleCloseAutoObject(hDocs);       hDocs = null }
     if (!null hWord) { 
         noError()
         oleMethod(hWord, "Quit")
@@ -26,18 +13,16 @@ bool startWordInstance() {
         hWord = null 
     }
     
-    // Create new Word instance
+    // 2. Launch new Word process
     hWord = oleCreateAutoObject("Word.Application")
-    if (null hWord) {
-        return false
-    }
+    if (null hWord) return false
     
-    // Performance & Stability Flags
+    // 3. Performance & Stability Flags
     olePut(hWord, "Visible", false)
-    olePut(hWord, "DisplayAlerts", 0)        // 0 = wdAlertsNone
-    olePut(hWord, "ScreenUpdating", false)   // Stops screen repainting
-
-    // Disable background proofing & AutoRecover I/O
+    olePut(hWord, "DisplayAlerts", 0)
+    olePut(hWord, "ScreenUpdating", false)
+    
+    // Speed optimization: Turn off proofing & AutoRecover
     OleAutoObj hOptions = null
     oleGet(hWord, "Options", hOptions)
     if (!null hOptions) {
@@ -47,90 +32,25 @@ bool startWordInstance() {
         olePut(hOptions, "SaveNormalPrompt", false)
         oleCloseAutoObject(hOptions)
     }
-
+    
     oleGet(hWord, "Documents", hDocs)
-    return true
-}
-
-// Start Word initially
-if (!startWordInstance()) {
-    ack "Fatal Error: Could not initialize Microsoft Word."
-    halt
-}
-
-print "Starting batch process of " totalFiles " files...\n"
-
-// --- MAIN PROCESSING LOOP ---
-int i
-for i in 0 .. (totalFiles - 1) do {
-    string srcHtml = htmlFiles[i]
-    string destPdf = pdfFiles[i]
     
-    // 1. RECYCLE WORD PROCESS EVERY N FILES TO PREVENT MEMORY LEAKS
-    if (docCounter >= BATCH_RECYCLE_LIMIT) {
-        print "Flushing Word memory heap... Recycling Word instance at index " i "\n"
-        if (!startWordInstance()) {
-            ack "Fatal Error: Failed to recycle Word instance."
-            halt
-        }
-        docCounter = 0
-    }
-    
-    OleAutoArgs args = null
-    
-    // 2. OPEN HTML FILE WITHOUT RETURNING AN hDoc OLE OBJECT
-    args = create
-    put(args, srcHtml) // 1. FileName
-    put(args, false)   // 2. ConfirmConversions = False
-    put(args, true)    // 3. ReadOnly = True
-    put(args, false)   // 4. AddToRecentFiles = False
+    // 4. RE-OPEN THE MACRO DOCUMENT IN THE NEW WORD PROCESS
+    OleAutoArgs macroOpenArgs = create
+    put(macroOpenArgs, MACRO_DOC_PATH)
+    put(macroOpenArgs, false) // ConfirmConversions = False
+    put(macroOpenArgs, true)  // ReadOnly = True
+    put(macroOpenArgs, false) // AddToRecentFiles = False
     
     noError()
-    // Notice: No 4th argument receiver (hDoc) passed to oleMethod
-    oleMethod(hDocs, "Open", args)
-    string openErr = lastError()
-    clear(args)
+    oleMethod(hDocs, "Open", macroOpenArgs, objMacroDoc)
+    string macroOpenErr = lastError()
+    clear(macroOpenArgs)
     
-    // Brief pause to allow Word's asynchronous HTML renderer to settle
-    sleep_(150)
-    
-    if (length(openErr) > 0) {
-        print "[ERROR] Failed to open file: " srcHtml " (" openErr ")\n"
-    } else {
-        // 3. RUN MACRO DIRECTLY VIA hWord
-        // (Macro targets ActiveDocument to format, export PDF, and close)
-        args = create
-        put(args, "YourMacroName") // Replace with actual Macro name
-        
-        noError()
-        oleMethod(hWord, "Run", args)
-        string macroErr = lastError()
-        clear(args)
-        
-        // 4. DETECT RPC / CRASH FAILURES
-        if (length(macroErr) > 0) {
-            print "[ERROR] Macro failure on index " i ": " macroErr "\n"
-            
-            // If Word crashed or RPC connection broke, recover automatically
-            if (contains(macroErr, "remote procedure call", 0) >= 0 || contains(macroErr, "argument names", 0) >= 0) {
-                print "   -> Word RPC crashed! Re-initializing Word server...\n"
-                startWordInstance()
-                docCounter = 0
-                continue // Move to next file
-            }
-        }
-        
-        docCounter++
+    if (length(macroOpenErr) > 0 || null objMacroDoc) {
+        print "[ERROR] Could not load macro document: " macroOpenErr "\n"
+        return false
     }
+    
+    return true
 }
-
-// --- CLEANUP AT END OF BATCH ---
-if (!null hWord) {
-    olePut(hWord, "ScreenUpdating", true)
-    oleMethod(hWord, "Quit")
-}
-
-if (!null hDocs) oleCloseAutoObject(hDocs)
-if (!null hWord) oleCloseAutoObject(hWord)
-
-print "Batch processing completed successfully.\n"
