@@ -36,7 +36,18 @@ bool startWordInstance() {
     olePut(hWord, "Visible", false)
     olePut(hWord, "DisplayAlerts", 0)        // 0 = wdAlertsNone
     olePut(hWord, "ScreenUpdating", false)   // Stops screen repainting
-    
+
+    // Disable background proofing & AutoRecover I/O
+    OleAutoObj hOptions = null
+    oleGet(hWord, "Options", hOptions)
+    if (!null hOptions) {
+        olePut(hOptions, "CheckSpellingAsYouType", false)
+        olePut(hOptions, "CheckGrammarAsYouType", false)
+        olePut(hOptions, "SaveInterval", 0)
+        olePut(hOptions, "SaveNormalPrompt", false)
+        oleCloseAutoObject(hOptions)
+    }
+
     oleGet(hWord, "Documents", hDocs)
     return true
 }
