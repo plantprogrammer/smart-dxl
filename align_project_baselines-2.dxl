@@ -7,23 +7,71 @@
    two copies / branches / environments of one project tree) and aligns their
    Baseline Set Definitions (BSDs) so that:
 
-     1. Both projects have the same set of named Baseline Set Definitions.
+     1. Both projects have the same set of named Baseline Set Definitions,
+        WHEREVER in the folder tree they live (BSDs can be defined on the
+        project root or on any subfolder - the script walks the whole tree
+        recursively, not just the top folder).
      2. Each BSD contains the same member modules in both projects.
      3. Each BSD has the same set of captured Baseline Set versions
         (versionID) in both projects.
 
-   NEW IN THIS VERSION: a DXL dialog lets the admin manually MAP a Baseline
-   Set Definition in Project A to the corresponding (but possibly
-   differently-named) Baseline Set Definition in Project B, instead of
-   relying on the two names matching exactly. BSDs whose names match exactly
-   are pre-matched automatically as a starting point; the admin can remove or
-   change any of those, and add mappings for anything named differently.
-   Anything left unmapped when "Run Alignment" is clicked is treated as
-   genuinely new and is created fresh in the other project.
+   A DXL dialog lets the admin manually MAP a Baseline Set Definition in
+   Project A to the corresponding (but possibly differently-named) Baseline
+   Set Definition in Project B, instead of relying on the two names matching
+   exactly. BSDs that share both the same relative subfolder path AND the
+   same name are pre-matched automatically as a starting point; the admin
+   can remove or change any of those, and add mappings for anything named
+   differently. Anything left unmapped when "Run Alignment" is clicked is
+   treated as genuinely new and is created fresh on the other side, in the
+   matching subfolder (if that subfolder doesn't exist on the other side,
+   the script warns and skips rather than guessing / creating folders).
+
+ A NOTE ON ARRAYS IN DXL (IMPORTANT - READ THIS)
+   Unlike arrays in many modern languages, plain DXL arrays are FIXED SIZE:
+   you must declare their maximum capacity up front (e.g. "string x[500]"),
+   and you cannot grow them past that by simply assigning to a new index.
+   There is no built-in "push"/"append" for plain arrays.
+
+   Because of this, every list this script builds (Baseline Set Definition
+   names, member module paths, captured version IDs, GUI list contents,
+   etc.) is represented as a PAIR of things:
+     - a fixed-size array declared with a generous maximum capacity, and
+     - a plain "int ...Count" variable that tracks how many of those slots
+       are actually in use right now.
+   "Appending" to one of these lists means: check count < capacity, write
+   into arr[count], then increment count. Every place that does this also
+   logs a warning (via capacityWarning()) if the capacity would be
+   exceeded, so the script fails gracefully and visibly instead of silently
+   dropping data or erroring out deep inside DOORS.
+
+   The capacity numbers are controlled from TWO places that must be kept in
+   sync if you ever need to raise them:
+     1. The MAX_BSDS / MAX_MEMBERS / MAX_VERSIONS int variables just below
+        (used in all the "< MAX_..." bounds checks).
+     2. The literal number in every "string someArray[500]" (etc.)
+        declaration that is sized off one of those constants. DXL array
+        sizes must be given directly, so the literal has to be typed out
+        again at each declaration - each such line has a comment noting
+        which constant it must match.
+   If you have more than ~500 Baseline Set Definitions total, more than
+   ~5000 modules in a single Baseline Set Definition, or more than ~500
+   captured versions under one BSD, raise both the constant and every
+   matching literal before running.
+
+   The one exception is the "Skip" type used inside createBaselineSetCapture()
+   below - Skip is a genuinely dynamic, growable DOORS container (confirmed
+   from a working community DXL example), unlike plain arrays, so it does
+   not need a pre-declared capacity.
 
  DOORS DATA MODEL USED (DXL 9.6/9.7 reference manual + community examples)
-   Folder                  - a Project is just a top-level Folder.
-   BaselineSetDefinition   - a named "recipe": which modules belong to a set.
+   Folder                  - a Project is just a top-level Folder; Folders
+                             can nest arbitrarily deep.
+   Item                    - generic handle for any folder child (Folder,
+                             Project, Formal/Link/Descriptive module, etc.);
+                             type(item) tells you which.
+   BaselineSetDefinition   - a named "recipe": which modules belong to a
+                             set. Can be defined on the project root or on
+                             ANY folder within the project.
    BaselineSet             - one captured/versioned snapshot of a BSD
                              (has a versionID, e.g. "1.0").
    ModName_                - a lightweight reference to a module (by path),
@@ -50,14 +98,18 @@
      that module already exists (at the matching relative path) in the
      target project. The script cannot create modules that don't exist yet;
      it will log those as warnings for a human to resolve.
+   - When a BSD is unmapped and only exists on one side, this script only
+     creates the matching BSD if the SAME relative subfolder path already
+     exists on the other side. It never creates folders on its own.
    - The GUI calls below (create/label/list/field/apply/ok/close/get/insert/
-     delete/set/show/hide/destroy) are assembled from several independently
-     confirmed working DXL examples (DOORS DXL forum, jazz.net archive,
-     community blogs). The Baseline/BaselineSet/BaselineSetDefinition calls
-     are likewise reconstructed from the DXL reference manual's table of
-     contents plus working community examples, not a single verbatim source
-     I could fully re-verify page by page. Test on a sandbox project first,
-     and expect to nudge minor syntax if your exact 9.7.2 build differs.
+     delete/set/show/hide/destroy) and the recursive folder-walk pattern are
+     assembled from several independently confirmed working DXL examples
+     (DOORS DXL forum, jazz.net archive, community blogs). The Baseline/
+     BaselineSet/BaselineSetDefinition calls are likewise reconstructed from
+     the DXL reference manual's table of contents plus working community
+     examples, not a single verbatim source I could fully re-verify page by
+     page. Test on a sandbox project first, and expect to nudge minor syntax
+     if your exact 9.7.2 build differs.
 
  CONFIGURE THE SECTION BELOW, THEN RUN FROM THE DXL EDITOR (Tools > Edit DXL)
 ================================================================================
@@ -83,6 +135,17 @@ bool CREATE_MISSING_BASELINE_SETS = false
 string LOG_FILE_PATH = ""
 
 // ------------------------------------------------------------------
+// ARRAY CAPACITY LIMITS - see "A NOTE ON ARRAYS IN DXL" above.
+// These are used in bounds checks; every fixed-size array declaration
+// elsewhere in the file has a comment saying which of these it must
+// match. Raise both together if you hit a capacity warning.
+// ------------------------------------------------------------------
+
+int MAX_BSDS     = 500   // combined max Baseline Set Definitions per project
+int MAX_MEMBERS  = 5000  // max member modules in a single Baseline Set Definition
+int MAX_VERSIONS = 500   // max captured Baseline Set versions under one BSD
+
+// ------------------------------------------------------------------
 // LOGGING
 // ------------------------------------------------------------------
 
@@ -95,6 +158,9 @@ void openLog()
         logStream_ = write(LOG_FILE_PATH)
 }
 
+// Central logging function - everything the script reports goes through
+// here so it always goes to both the DXL output window and (optionally)
+// the log file at the same time.
 void log(string s)
 {
     print s "\n"
@@ -108,14 +174,26 @@ void closeLog()
         close(logStream_)
 }
 
+// Standard warning printed whenever a fixed-size array would have been
+// asked to hold more items than its declared capacity. See the note at
+// the top of the file about keeping MAX_* constants and array-size
+// literals in sync.
+void capacityWarning(string what, int max)
+{
+    log("  WARNING: \"" what "\" reached its capacity of " max
+        " entries. Some items were skipped. Raise the matching MAX_* "
+        "constant AND array-size literal near the top of this script, then re-run.")
+}
+
 // ------------------------------------------------------------------
-// SMALL STRING / ARRAY HELPERS
+// SMALL STRING / PATH HELPERS
 // ------------------------------------------------------------------
 
 // Returns the part of "full" that comes after the "prefix" characters.
-// Used to turn an absolute module path in one project into a path that is
-// relative to that project's root, so it can be compared against / rebuilt
-// under the other project's root.
+// Used to turn an absolute folder/module path into a path that is
+// relative to a project's root. This works purely on individual
+// characters via string indexing/concatenation, so it is not affected by
+// the fixed-array-capacity issue described above.
 string stripPrefix(string full, string prefix)
 {
     int lenPrefix = length(prefix)
@@ -132,35 +210,76 @@ string stripPrefix(string full, string prefix)
     return result
 }
 
-bool arrayContains(string arr[], string val)
+// Checks whether "val" is present among the first "count" entries of
+// "arr". "count" is passed explicitly (rather than using the array's
+// declared capacity) because the array itself will usually be larger
+// than the number of entries actually in use - see the note on arrays
+// at the top of this file.
+bool arrayContains(string arr[], int count, string val)
 {
-    if (sizeof(arr) == 0)
+    if (count == 0)
         return false
 
     int i
-    for i in 0:sizeof(arr)-1 do
+    for i in 0:count-1 do
         if (arr[i] == val)
             return true
 
     return false
 }
 
+// Resolves a folder given a project root path and a path relative to that
+// root ("" means the project root itself).
+Folder resolveFolderByRelPath(string projRootFull, string relPath)
+{
+    if (relPath == "")
+        return folder(projRootFull)
+    return folder(projRootFull relPath)
+}
+
+// Human-readable label for a (folder, name) pair, used in the GUI lists,
+// e.g. "/SubSystem/Requirements :: Release Set" or
+// "(project root) :: Release Set".
+string formatEntry(string folderRel, string bsdName)
+{
+    if (folderRel == "")
+        return "(project root) :: " bsdName
+    return folderRel " :: " bsdName
+}
+
 // ------------------------------------------------------------------
 // GLOBAL STATE FOR THE MAPPING DIALOG
+//
+// Every list below is a fixed-size array plus a "...Count" variable
+// giving the number of slots currently in use (see the note on arrays
+// at the top of the file). The array sizes (500) must match MAX_BSDS.
 // ------------------------------------------------------------------
 
-Folder g_dlgProjA
-Folder g_dlgProjB
 string g_dlgRootA
 string g_dlgRootB
 
-// Parallel arrays: confirmed mapping i is (g_mapNameA[i] <-> g_mapNameB[i])
-string g_mapNameA[]
-string g_mapNameB[]
+// Confirmed mappings: pair i (for i in 0..g_mapCount-1) is
+// (g_mapNameA[i] in g_mapFolderA[i]) <-> (g_mapNameB[i] in g_mapFolderB[i])
+string g_mapNameA[500]     // size must match MAX_BSDS
+string g_mapFolderA[500]   // size must match MAX_BSDS
+string g_mapNameB[500]     // size must match MAX_BSDS
+string g_mapFolderB[500]   // size must match MAX_BSDS
+int    g_mapCount = 0
 
-// Mirrors of what is currently shown (unmapped) in each side's list widget
-string g_curA[]
-string g_curB[]
+// What is currently shown (still unmapped) on the Project A side.
+// g_curA holds the display strings (what the widget shows, and what
+// get(g_listA, i) returns); g_curNameA / g_curFolderA hold the real
+// underlying data, always kept in lock-step with g_curA by index.
+string g_curA[500]         // size must match MAX_BSDS
+string g_curNameA[500]     // size must match MAX_BSDS
+string g_curFolderA[500]   // size must match MAX_BSDS
+int    g_curACount = 0
+
+// Same idea, for the Project B side.
+string g_curB[500]         // size must match MAX_BSDS
+string g_curNameB[500]     // size must match MAX_BSDS
+string g_curFolderB[500]   // size must match MAX_BSDS
+int    g_curBCount = 0
 
 DB  g_mapDlg
 DBE g_listA
@@ -170,128 +289,241 @@ DBE g_status
 
 // ------------------------------------------------------------------
 // ARRAY BOOKKEEPING HELPERS FOR THE MAPPING DIALOG
-// (operate directly on the globals above - see comments in the code
-//  for why these are not generic array-parameter functions)
+//
+// These operate directly on the fixed-size globals above by SHIFTING
+// entries left or right in place and adjusting the relevant "...Count"
+// variable - there is no array resizing or reassignment anywhere here,
+// only writes to existing, already-declared slots.
 // ------------------------------------------------------------------
 
+// Removes the entry at index "idx" from the Project A "still unmapped"
+// list by shifting every later entry one slot to the left, then
+// shrinking the count by one. (If idx is the last used slot, the shift
+// loop below simply does nothing, which is exactly what we want.)
 void removeFromCurA(int idx)
 {
-    string result[]
     int i
-    if (sizeof(g_curA) > 0)
-        for i in 0:sizeof(g_curA)-1 do
-            if (i != idx)
-                result[sizeof(result)] = g_curA[i]
-    g_curA = result
+    for i in idx:g_curACount-2 do
+    {
+        g_curA[i] = g_curA[i+1]
+        g_curNameA[i] = g_curNameA[i+1]
+        g_curFolderA[i] = g_curFolderA[i+1]
+    }
+    g_curACount = g_curACount - 1
 }
 
+// Same as removeFromCurA, for the Project B side.
 void removeFromCurB(int idx)
 {
-    string result[]
     int i
-    if (sizeof(g_curB) > 0)
-        for i in 0:sizeof(g_curB)-1 do
-            if (i != idx)
-                result[sizeof(result)] = g_curB[i]
-    g_curB = result
+    for i in idx:g_curBCount-2 do
+    {
+        g_curB[i] = g_curB[i+1]
+        g_curNameB[i] = g_curNameB[i+1]
+        g_curFolderB[i] = g_curFolderB[i+1]
+    }
+    g_curBCount = g_curBCount - 1
 }
 
-void prependToCurA(string val)
+// Adds one entry back to the FRONT of the Project A "still unmapped"
+// list (used when the admin removes a confirmed mapping). Every existing
+// entry is shifted one slot to the right first to make room at index 0.
+void prependToCurA(string disp, string nm, string fld)
 {
-    string result[]
-    result[0] = val
-    int i
-    if (sizeof(g_curA) > 0)
-        for i in 0:sizeof(g_curA)-1 do
-            result[sizeof(result)] = g_curA[i]
-    g_curA = result
+    if (g_curACount >= 500)   // must match MAX_BSDS
+    {
+        capacityWarning("Project A unmapped BSD list", MAX_BSDS)
+        return
+    }
+
+    int i = g_curACount
+    while (i > 0)
+    {
+        g_curA[i] = g_curA[i-1]
+        g_curNameA[i] = g_curNameA[i-1]
+        g_curFolderA[i] = g_curFolderA[i-1]
+        i = i - 1
+    }
+    g_curA[0] = disp
+    g_curNameA[0] = nm
+    g_curFolderA[0] = fld
+    g_curACount = g_curACount + 1
 }
 
-void prependToCurB(string val)
+// Same as prependToCurA, for the Project B side.
+void prependToCurB(string disp, string nm, string fld)
 {
-    string result[]
-    result[0] = val
-    int i
-    if (sizeof(g_curB) > 0)
-        for i in 0:sizeof(g_curB)-1 do
-            result[sizeof(result)] = g_curB[i]
-    g_curB = result
+    if (g_curBCount >= 500)   // must match MAX_BSDS
+    {
+        capacityWarning("Project B unmapped BSD list", MAX_BSDS)
+        return
+    }
+
+    int i = g_curBCount
+    while (i > 0)
+    {
+        g_curB[i] = g_curB[i-1]
+        g_curNameB[i] = g_curNameB[i-1]
+        g_curFolderB[i] = g_curFolderB[i-1]
+        i = i - 1
+    }
+    g_curB[0] = disp
+    g_curNameB[0] = nm
+    g_curFolderB[0] = fld
+    g_curBCount = g_curBCount + 1
 }
 
+// Removes the confirmed mapping at index "idx" by shifting every later
+// mapping one slot to the left across all four parallel arrays, then
+// shrinking g_mapCount.
 void removeMappingAt(int idx)
 {
-    string newA[]
-    string newB[]
     int i
-    if (sizeof(g_mapNameA) > 0)
-        for i in 0:sizeof(g_mapNameA)-1 do
-            if (i != idx)
-            {
-                newA[sizeof(newA)] = g_mapNameA[i]
-                newB[sizeof(newB)] = g_mapNameB[i]
-            }
-    g_mapNameA = newA
-    g_mapNameB = newB
+    for i in idx:g_mapCount-2 do
+    {
+        g_mapNameA[i] = g_mapNameA[i+1]
+        g_mapFolderA[i] = g_mapFolderA[i+1]
+        g_mapNameB[i] = g_mapNameB[i+1]
+        g_mapFolderB[i] = g_mapFolderB[i+1]
+    }
+    g_mapCount = g_mapCount - 1
 }
 
 // ------------------------------------------------------------------
 // BASELINE / BSD HELPERS
 // ------------------------------------------------------------------
 
-// Finds a BaselineSetDefinition by name inside a project (Folder).
-bool findBSDByName(Folder proj, string bsdName, BaselineSetDefinition &foundBsd)
+// Searches the Baseline Set Definitions defined DIRECTLY on one folder
+// (not its subfolders) for one named "bsdName". Returns true and sets
+// outBsd if found.
+bool findBSDByNameInFolder(Folder fld, string bsdName, BaselineSetDefinition &outBsd)
 {
+    if (null fld)
+        return false
+
     BaselineSetDefinition b
-    for b in proj do
+    for b in fld do
     {
         if (name(b) == bsdName)
         {
-            foundBsd = b
+            outBsd = b
             return true
         }
     }
     return false
 }
 
-void collectBSDNames(Folder proj, string names[])
+// Resolves a BSD given a project root, a folder relative to that root
+// ("" = project root), and the BSD's name. This is how we turn the
+// (root, folder, name) triples stored in the mapping dialog's arrays
+// back into a real, usable BaselineSetDefinition handle whenever we
+// actually need to act on one.
+bool findBSD(string projRootFull, string relFolderPath, string bsdName, BaselineSetDefinition &outBsd)
 {
+    Folder fld = resolveFolderByRelPath(projRootFull, relFolderPath)
+    return findBSDByNameInFolder(fld, bsdName, outBsd)
+}
+
+// Recursively walks a folder tree, collecting every Baseline Set
+// Definition found anywhere in it (the folder itself, and every
+// subfolder underneath), along with the path of the folder it lives on,
+// relative to the project root. "names"/"folders" are fixed-size arrays
+// (capacity MAX_BSDS) supplied by the caller; "count" is passed by
+// reference so it keeps accumulating correctly across every recursive
+// call, since all calls share the same underlying counter.
+void collectBSDsRecursive(Folder fld, string projRootFull, string names[], string folders[], int &count)
+{
+    string relHere = stripPrefix(fullName(fld), projRootFull)
+
+    // Baseline Set Definitions that live directly on this folder.
     BaselineSetDefinition b
-    for b in proj do
-        names[sizeof(names)] = name(b)
+    for b in fld do
+    {
+        if (count < MAX_BSDS)
+        {
+            names[count] = name(b)
+            folders[count] = relHere
+            count = count + 1
+        }
+        else
+            capacityWarning("Baseline Set Definition list", MAX_BSDS)
+    }
+
+    // Recurse into every subfolder (and nested sub-project, if any).
+    Item itm
+    for itm in fld do
+    {
+        if (type(itm) == "Folder" || type(itm) == "Project")
+        {
+            Folder sub = folder(fullName(itm))
+            collectBSDsRecursive(sub, projRootFull, names, folders, count)
+        }
+    }
 }
 
 // Collects the relative (project-root-stripped) paths of every module
-// that is a member of the given BSD.
-void getMemberRelativePaths(BaselineSetDefinition bsd, string projRootFull, string relPaths[])
+// that is a member of the given BSD. "relPaths" has capacity MAX_MEMBERS;
+// "count" is passed by reference and updated as entries are added.
+void getMemberRelativePaths(BaselineSetDefinition bsd, string projRootFull, string relPaths[], int &count)
 {
     ModName_ m
     for m in bsd do
-        relPaths[sizeof(relPaths)] = stripPrefix(fullName(m), projRootFull)
+    {
+        if (count < MAX_MEMBERS)
+        {
+            relPaths[count] = stripPrefix(fullName(m), projRootFull)
+            count = count + 1
+        }
+        else
+            capacityWarning("member module list", MAX_MEMBERS)
+    }
 }
 
 // Collects the versionID of every BaselineSet captured under a BSD.
-void getCapturedVersions(BaselineSetDefinition bsd, string versions[])
+// "versions" has capacity MAX_VERSIONS; "count" is passed by reference.
+void getCapturedVersions(BaselineSetDefinition bsd, string versions[], int &count)
 {
     BaselineSet bs
     for bs in bsd do
-        versions[sizeof(versions)] = versionID(bs)
+    {
+        if (count < MAX_VERSIONS)
+        {
+            versions[count] = versionID(bs)
+            count = count + 1
+        }
+        else
+            capacityWarning("captured Baseline Set version list", MAX_VERSIONS)
+    }
 }
 
-int countCapturedBaselineSets(Folder proj)
+// Recursively counts every captured Baseline Set anywhere in the project
+// tree. Used only for the informational summary line printed in main();
+// this is a plain running total (an int, not an array), so it is not
+// affected by the fixed-array-capacity issue.
+int countCapturedBaselineSetsRecursive(Folder fld)
 {
     int total = 0
+
     BaselineSetDefinition b
-    for b in proj do
+    for b in fld do
     {
         BaselineSet bs
         for bs in b do
             total++
     }
+
+    Item itm
+    for itm in fld do
+        if (type(itm) == "Folder" || type(itm) == "Project")
+            total = total + countCapturedBaselineSetsRecursive(folder(fullName(itm)))
+
     return total
 }
 
 // Adds one module (identified by its path relative to the target
-// project's root) to a BaselineSetDefinition's membership.
+// project's root) to a BaselineSetDefinition's membership. Looks the
+// module up by path via module() rather than opening it, so this does
+// not require a read/write lock on the module itself.
 void addMissingModule(string projRootFull, BaselineSetDefinition bsd, string relPath)
 {
     string fullPath = projRootFull relPath
@@ -311,18 +543,25 @@ void addMissingModule(string projRootFull, BaselineSetDefinition bsd, string rel
         log("    Added module \"" fullPath "\" to BSD \"" name(bsd) "\"")
 }
 
-// Creates a missing BaselineSetDefinition in the target project, copying
-// the description from the source project's BSD but keeping the name the
-// admin asked for (may differ from the source BSD's name).
-bool createMissingBSD(Folder targetProj, string bsdName, string bsdDesc, BaselineSetDefinition &outBsd)
+// Creates a missing BaselineSetDefinition on the given target folder,
+// copying the description from the source project's BSD but keeping the
+// name the admin asked for (may differ from the source BSD's name).
+bool createMissingBSD(Folder targetFolder, string bsdName, string bsdDesc, BaselineSetDefinition &outBsd)
 {
-    string err = create(targetProj, bsdName, bsdDesc, outBsd)
+    if (null targetFolder)
+    {
+        log("  ERROR: destination folder does not exist - cannot create Baseline Set Definition \""
+            bsdName "\" there.")
+        return false
+    }
+
+    string err = create(targetFolder, bsdName, bsdDesc, outBsd)
     if (!null err)
     {
         log("  ERROR creating Baseline Set Definition \"" bsdName "\": " err)
         return false
     }
-    log("  Created Baseline Set Definition \"" bsdName "\" in " fullName(targetProj))
+    log("  Created Baseline Set Definition \"" bsdName "\" on " fullName(targetFolder))
     return true
 }
 
@@ -330,6 +569,11 @@ bool createMissingBSD(Folder targetProj, string bsdName, string bsdDesc, Baselin
 // modules currently sit in it, tagged with the supplied version label.
 // See the safety note at the top of this file: this is NOT a historical
 // replica, it's a fresh capture taken right now.
+//
+// NOTE: "Skip" here is a genuinely dynamic DOORS container (confirmed
+// from a working community DXL example) - unlike the plain string/bool
+// arrays used everywhere else in this file, it does not need a
+// pre-declared capacity, so put() can just keep growing it.
 bool createBaselineSetCapture(BaselineSetDefinition bsd, string versionLabel, string desc)
 {
     string err = lock(bsd)
@@ -375,25 +619,47 @@ bool createBaselineSetCapture(BaselineSetDefinition bsd, string versionLabel, st
 //  how many Baseline Sets each side has already captured)
 // ------------------------------------------------------------------
 
+// Brings "targetBsd" (in targetRoot's project) up to date with
+// "refBsd" (in refRoot's project): adds any member modules refBsd has
+// that targetBsd doesn't, and (optionally) captures any Baseline Set
+// versions refBsd has that targetBsd is missing.
 void alignOneDirection(BaselineSetDefinition refBsd, string refRoot,
                         BaselineSetDefinition targetBsd, string targetRoot)
 {
-    string refMembers[]
-    getMemberRelativePaths(refBsd, refRoot, refMembers)
-    string targetMembers[]
-    getMemberRelativePaths(targetBsd, targetRoot, targetMembers)
+    // ---- step 1: compare member-module lists ----
 
-    string missingMembers[]
+    string refMembers[5000]        // size must match MAX_MEMBERS
+    int refMembersCount = 0
+    getMemberRelativePaths(refBsd, refRoot, refMembers, refMembersCount)
+
+    string targetMembers[5000]     // size must match MAX_MEMBERS
+    int targetMembersCount = 0
+    getMemberRelativePaths(targetBsd, targetRoot, targetMembers, targetMembersCount)
+
+    string missingMembers[5000]    // size must match MAX_MEMBERS
+    int missingMembersCount = 0
     int i
-    if (sizeof(refMembers) > 0)
-        for i in 0:sizeof(refMembers)-1 do
-            if (!arrayContains(targetMembers, refMembers[i]))
-                missingMembers[sizeof(missingMembers)] = refMembers[i]
-
-    if (sizeof(missingMembers) > 0)
+    if (refMembersCount > 0)
     {
-        log("  " sizeof(missingMembers) " module(s) missing from target BSD membership:")
-        for i in 0:sizeof(missingMembers)-1 do
+        for i in 0:refMembersCount-1 do
+        {
+            if (!arrayContains(targetMembers, targetMembersCount, refMembers[i]))
+            {
+                if (missingMembersCount < MAX_MEMBERS)
+                {
+                    missingMembers[missingMembersCount] = refMembers[i]
+                    missingMembersCount = missingMembersCount + 1
+                }
+                else
+                    capacityWarning("missing-member list", MAX_MEMBERS)
+            }
+        }
+    }
+
+    if (missingMembersCount > 0)
+    {
+        log("  " missingMembersCount " module(s) missing from target BSD membership:")
+        for i in 0:missingMembersCount-1 do
             log("    - " missingMembers[i])
 
         if (APPLY_CHANGES)
@@ -401,7 +667,7 @@ void alignOneDirection(BaselineSetDefinition refBsd, string refRoot,
             string lockErr = lock(targetBsd)
             if (null lockErr)
             {
-                for i in 0:sizeof(missingMembers)-1 do
+                for i in 0:missingMembersCount-1 do
                     addMissingModule(targetRoot, targetBsd, missingMembers[i])
                 save(targetBsd)
                 unlock(targetBsd)
@@ -415,27 +681,47 @@ void alignOneDirection(BaselineSetDefinition refBsd, string refRoot,
     else
         log("  Module membership already aligned.")
 
-    string refVersions[]
-    getCapturedVersions(refBsd, refVersions)
-    string targetVersions[]
-    getCapturedVersions(targetBsd, targetVersions)
+    // ---- step 2: compare captured Baseline Set version lists ----
 
-    string missingVersions[]
-    if (sizeof(refVersions) > 0)
-        for i in 0:sizeof(refVersions)-1 do
-            if (!arrayContains(targetVersions, refVersions[i]))
-                missingVersions[sizeof(missingVersions)] = refVersions[i]
+    string refVersions[500]        // size must match MAX_VERSIONS
+    int refVersionsCount = 0
+    getCapturedVersions(refBsd, refVersions, refVersionsCount)
 
-    if (sizeof(missingVersions) > 0)
+    string targetVersions[500]     // size must match MAX_VERSIONS
+    int targetVersionsCount = 0
+    getCapturedVersions(targetBsd, targetVersions, targetVersionsCount)
+
+    string missingVersions[500]    // size must match MAX_VERSIONS
+    int missingVersionsCount = 0
+    if (refVersionsCount > 0)
     {
-        log("  " sizeof(missingVersions) " Baseline Set version(s) captured on the reference side but not on the target side:")
-        for i in 0:sizeof(missingVersions)-1 do
+        for i in 0:refVersionsCount-1 do
+        {
+            if (!arrayContains(targetVersions, targetVersionsCount, refVersions[i]))
+            {
+                if (missingVersionsCount < MAX_VERSIONS)
+                {
+                    missingVersions[missingVersionsCount] = refVersions[i]
+                    missingVersionsCount = missingVersionsCount + 1
+                }
+                else
+                    capacityWarning("missing-version list", MAX_VERSIONS)
+            }
+        }
+    }
+
+    if (missingVersionsCount > 0)
+    {
+        log("  " missingVersionsCount " Baseline Set version(s) captured on the reference side but not on the target side:")
+        for i in 0:missingVersionsCount-1 do
             log("    - " missingVersions[i])
 
         if (APPLY_CHANGES && CREATE_MISSING_BASELINE_SETS)
         {
-            for i in 0:sizeof(missingVersions)-1 do
+            for i in 0:missingVersionsCount-1 do
             {
+                // Find the matching captured set on the reference side so
+                // we can copy its description into the new capture.
                 string desc = ""
                 BaselineSet matchBs
                 for matchBs in refBsd do
@@ -454,23 +740,27 @@ void alignOneDirection(BaselineSetDefinition refBsd, string refRoot,
         log("  Captured Baseline Set versions already aligned.")
 }
 
-// Aligns one confirmed pair of BSDs (bsdNameA in projA <-> bsdNameB in
-// projB), choosing direction by whichever side has captured fewer
-// Baseline Sets so far for that pair.
-void alignPair(Folder projA, string rootA, string bsdNameA,
-               Folder projB, string rootB, string bsdNameB)
+// Aligns one confirmed pair of BSDs: (bsdNameA, in folder folderA of
+// Project A) <-> (bsdNameB, in folder folderB of Project B). Direction is
+// chosen by whichever side has captured fewer Baseline Sets so far -
+// that side is treated as "behind" and gets caught up to the other.
+void alignPair(string rootA, string folderA, string bsdNameA,
+               string rootB, string folderB, string bsdNameB)
 {
     BaselineSetDefinition bsdA
     BaselineSetDefinition bsdB
-    bool foundA = findBSDByName(projA, bsdNameA, bsdA)
-    bool foundB = findBSDByName(projB, bsdNameB, bsdB)
+    bool foundA = findBSD(rootA, folderA, bsdNameA, bsdA)
+    bool foundB = findBSD(rootB, folderB, bsdNameB, bsdB)
 
     if (!foundA || !foundB)
     {
-        log("  ERROR: could not re-locate mapped BSD \"" bsdNameA "\" <-> \"" bsdNameB "\" - skipping.")
+        log("  ERROR: could not re-locate mapped BSD \"" bsdNameA "\" (folder \""
+            (folderA == "" ? "root" : folderA) "\") <-> \"" bsdNameB "\" (folder \""
+            (folderB == "" ? "root" : folderB) "\") - skipping.")
         return
     }
 
+    // Count captured Baseline Sets on each side to decide direction.
     int countA = 0
     BaselineSet tmpBs
     for tmpBs in bsdA do
@@ -480,51 +770,66 @@ void alignPair(Folder projA, string rootA, string bsdNameA,
         countB++
 
     log("")
-    log("BSD pair: \"" bsdNameA "\" (Project A, " countA " captured set(s)) <-> \""
-        bsdNameB "\" (Project B, " countB " captured set(s))")
+    log("BSD pair: \"" bsdNameA "\" in " (folderA == "" ? "project root" : folderA)
+        " (Project A, " countA " captured set(s)) <-> \"" bsdNameB "\" in "
+        (folderB == "" ? "project root" : folderB) " (Project B, " countB " captured set(s))")
 
     if (countA >= countB)
-        alignOneDirection(bsdA, rootA, bsdB, rootB)
+        alignOneDirection(bsdA, rootA, bsdB, rootB)   // A is ahead (or tied); B catches up
     else
-        alignOneDirection(bsdB, rootB, bsdA, rootA)
+        alignOneDirection(bsdB, rootB, bsdA, rootA)   // B is ahead; A catches up
 }
 
-// Handles a BSD that only exists on one side: creates a same-named BSD in
-// the other project, mirrors its membership, and (optionally) its
-// captured Baseline Set versions.
-void createFreshBSDCopy(Folder sourceProj, string sourceRoot, string bsdName,
-                         Folder destProj, string destRoot)
+// Handles a BSD that only exists on one side: creates a same-named BSD on
+// the matching subfolder on the other side, mirrors its membership, and
+// (optionally) its captured Baseline Set versions.
+void createFreshBSDCopy(string sourceRoot, string folderRel, string bsdName, string destRoot)
 {
     log("")
-    log("BSD \"" bsdName "\" exists only in \"" fullName(sourceProj) "\".")
+    log("BSD \"" bsdName "\" (folder \"" (folderRel == "" ? "project root" : folderRel)
+        "\") exists only on one side.")
 
     if (!APPLY_CHANGES)
     {
-        log("  (dry run - set APPLY_CHANGES = true to create a matching BSD in \"" fullName(destProj) "\")")
+        log("  (dry run - set APPLY_CHANGES = true to create a matching BSD on the other side)")
         return
     }
 
     BaselineSetDefinition sourceBsd
-    if (!findBSDByName(sourceProj, bsdName, sourceBsd))
+    if (!findBSD(sourceRoot, folderRel, bsdName, sourceBsd))
     {
-        log("  ERROR: could not re-locate BSD \"" bsdName "\" in source project - skipping.")
+        log("  ERROR: could not re-locate source BSD - skipping.")
+        return
+    }
+
+    // The new BSD must land on the SAME relative folder on the other
+    // side. We do not create folders ourselves - if it isn't there, warn
+    // and skip so the admin can decide what to do.
+    Folder destFolder = resolveFolderByRelPath(destRoot, folderRel)
+    if (null destFolder)
+    {
+        log("  WARNING: the corresponding folder \"" (folderRel == "" ? "(project root)" : folderRel)
+            "\" does not exist on the other side, so a matching Baseline Set Definition cannot be "
+            "created there. Create the folder structure first (or map this BSD manually), then re-run.")
         return
     }
 
     BaselineSetDefinition newBsd
-    if (!createMissingBSD(destProj, bsdName, description(sourceBsd), newBsd))
+    if (!createMissingBSD(destFolder, bsdName, description(sourceBsd), newBsd))
         return
 
-    string sourceMembers[]
-    getMemberRelativePaths(sourceBsd, sourceRoot, sourceMembers)
+    // Mirror membership.
+    string sourceMembers[5000]     // size must match MAX_MEMBERS
+    int sourceMembersCount = 0
+    getMemberRelativePaths(sourceBsd, sourceRoot, sourceMembers, sourceMembersCount)
 
-    if (sizeof(sourceMembers) > 0)
+    if (sourceMembersCount > 0)
     {
         string lockErr = lock(newBsd)
         if (null lockErr)
         {
             int i
-            for i in 0:sizeof(sourceMembers)-1 do
+            for i in 0:sourceMembersCount-1 do
                 addMissingModule(destRoot, newBsd, sourceMembers[i])
             save(newBsd)
             unlock(newBsd)
@@ -533,14 +838,17 @@ void createFreshBSDCopy(Folder sourceProj, string sourceRoot, string bsdName,
             log("  ERROR locking newly created BSD: " lockErr)
     }
 
+    // Optionally mirror captured versions too (subject to the same
+    // "this is a fresh capture, not history" caveat as elsewhere).
     if (CREATE_MISSING_BASELINE_SETS)
     {
-        string versions[]
-        getCapturedVersions(sourceBsd, versions)
-        if (sizeof(versions) > 0)
+        string versions[500]       // size must match MAX_VERSIONS
+        int versionsCount = 0
+        getCapturedVersions(sourceBsd, versions, versionsCount)
+        if (versionsCount > 0)
         {
             int i
-            for i in 0:sizeof(versions)-1 do
+            for i in 0:versionsCount-1 do
             {
                 string desc = ""
                 BaselineSet matchBs
@@ -556,12 +864,21 @@ void createFreshBSDCopy(Folder sourceProj, string sourceRoot, string bsdName,
 
 // ------------------------------------------------------------------
 // MAPPING DIALOG CALLBACKS
+//
+// DXL's dialog widgets are event-driven: show(g_mapDlg) returns
+// immediately, and everything else happens inside these callback
+// functions as the admin clicks buttons. That is also why all the state
+// they need (g_mapNameA, g_curA, etc.) lives in globals rather than
+// local variables - each callback is invoked fresh by DOORS with no
+// memory of anything except what is stored globally.
 // ------------------------------------------------------------------
 
+// "Map Selected Pair ->": takes whatever is currently selected in each
+// unmapped list and turns it into a confirmed mapping.
 void cbAddMapping(DB d)
 {
-    int i = get(g_listA)
-    int j = get(g_listB)
+    int i = get(g_listA)   // selected index in the Project A list, or -1
+    int j = get(g_listB)   // selected index in the Project B list, or -1
 
     if (i < 0 || j < 0)
     {
@@ -569,21 +886,40 @@ void cbAddMapping(DB d)
         return
     }
 
-    string nameA = get(g_listA, i)
-    string nameB = get(g_listB, j)
+    if (g_mapCount >= 500)   // must match MAX_BSDS
+    {
+        set(g_status, "Mapping list is full - cannot map any more pairs.")
+        capacityWarning("confirmed mapping list", MAX_BSDS)
+        return
+    }
 
-    g_mapNameA[sizeof(g_mapNameA)] = nameA
-    g_mapNameB[sizeof(g_mapNameB)] = nameB
-    insert(g_listMap, sizeof(g_mapNameA)-1, nameA " -> " nameB)
+    string dispA = g_curA[i]
+    string dispB = g_curB[j]
+    string nameA = g_curNameA[i]
+    string foldA = g_curFolderA[i]
+    string nameB = g_curNameB[j]
+    string foldB = g_curFolderB[j]
 
+    // Record the confirmed mapping.
+    g_mapNameA[g_mapCount] = nameA
+    g_mapFolderA[g_mapCount] = foldA
+    g_mapNameB[g_mapCount] = nameB
+    g_mapFolderB[g_mapCount] = foldB
+    insert(g_listMap, g_mapCount, dispA " -> " dispB)
+    g_mapCount = g_mapCount + 1
+
+    // Remove both items from the "still unmapped" lists (widget + our
+    // bookkeeping arrays) so they can't accidentally be mapped again.
     delete(g_listA, i)
     delete(g_listB, j)
     removeFromCurA(i)
     removeFromCurB(j)
 
-    set(g_status, "Mapped \"" nameA "\" -> \"" nameB "\".")
+    set(g_status, "Mapped \"" dispA "\" -> \"" dispB "\".")
 }
 
+// "Remove Selected Mapping": undoes a confirmed mapping and puts both
+// sides back into their respective "still unmapped" lists.
 void cbRemoveMapping(DB d)
 {
     int k = get(g_listMap)
@@ -594,19 +930,27 @@ void cbRemoveMapping(DB d)
     }
 
     string nameA = g_mapNameA[k]
+    string foldA = g_mapFolderA[k]
     string nameB = g_mapNameB[k]
+    string foldB = g_mapFolderB[k]
 
-    insert(g_listA, 0, nameA)
-    insert(g_listB, 0, nameB)
-    prependToCurA(nameA)
-    prependToCurB(nameB)
+    string dispA = formatEntry(foldA, nameA)
+    string dispB = formatEntry(foldB, nameB)
+
+    insert(g_listA, 0, dispA)
+    insert(g_listB, 0, dispB)
+    prependToCurA(dispA, nameA, foldA)
+    prependToCurB(dispB, nameB, foldB)
 
     delete(g_listMap, k)
     removeMappingAt(k)
 
-    set(g_status, "Removed mapping for \"" nameA "\" - it is back in the unmapped lists.")
+    set(g_status, "Removed mapping for \"" dispA "\" - it is back in the unmapped lists.")
 }
 
+// "Run Alignment": closes the dialog and performs the actual work -
+// aligning every confirmed pair, then creating fresh BSDs for whatever
+// was left unmapped on either side.
 void cbRunAlignment(DB d)
 {
     hide(d)
@@ -619,46 +963,53 @@ void cbRunAlignment(DB d)
 
     int i
 
-    log("Confirmed name mappings (Project A <-> Project B):")
-    if (sizeof(g_mapNameA) > 0)
-        for i in 0:sizeof(g_mapNameA)-1 do
-            log("  \"" g_mapNameA[i] "\" <-> \"" g_mapNameB[i] "\"")
+    log("Confirmed mappings (Project A <-> Project B):")
+    if (g_mapCount > 0)
+    {
+        for i in 0:g_mapCount-1 do
+            log("  \"" g_mapNameA[i] "\" (" (g_mapFolderA[i] == "" ? "root" : g_mapFolderA[i])
+                ") <-> \"" g_mapNameB[i] "\" (" (g_mapFolderB[i] == "" ? "root" : g_mapFolderB[i]) ")")
+    }
     else
         log("  (none)")
 
-    if (sizeof(g_curA) > 0)
+    if (g_curACount > 0)
     {
         log("BSDs left unmapped in Project A:")
-        for i in 0:sizeof(g_curA)-1 do
-            log("  \"" g_curA[i] "\"")
+        for i in 0:g_curACount-1 do
+            log("  \"" g_curNameA[i] "\" (" (g_curFolderA[i] == "" ? "root" : g_curFolderA[i]) ")")
     }
-    if (sizeof(g_curB) > 0)
+    if (g_curBCount > 0)
     {
         log("BSDs left unmapped in Project B:")
-        for i in 0:sizeof(g_curB)-1 do
-            log("  \"" g_curB[i] "\"")
+        for i in 0:g_curBCount-1 do
+            log("  \"" g_curNameB[i] "\" (" (g_curFolderB[i] == "" ? "root" : g_curFolderB[i]) ")")
     }
 
-    // 1. process confirmed pairs (exists on both sides, possibly different names)
-    if (sizeof(g_mapNameA) > 0)
-        for i in 0:sizeof(g_mapNameA)-1 do
-            alignPair(g_dlgProjA, g_dlgRootA, g_mapNameA[i], g_dlgProjB, g_dlgRootB, g_mapNameB[i])
+    // 1. process confirmed pairs (exists on both sides, possibly
+    //    different names and/or different folders)
+    if (g_mapCount > 0)
+        for i in 0:g_mapCount-1 do
+            alignPair(g_dlgRootA, g_mapFolderA[i], g_mapNameA[i],
+                      g_dlgRootB, g_mapFolderB[i], g_mapNameB[i])
 
-    // 2. A-only leftovers -> create fresh in B
-    if (sizeof(g_curA) > 0)
-        for i in 0:sizeof(g_curA)-1 do
-            createFreshBSDCopy(g_dlgProjA, g_dlgRootA, g_curA[i], g_dlgProjB, g_dlgRootB)
+    // 2. A-only leftovers -> create fresh in B, same relative folder
+    if (g_curACount > 0)
+        for i in 0:g_curACount-1 do
+            createFreshBSDCopy(g_dlgRootA, g_curFolderA[i], g_curNameA[i], g_dlgRootB)
 
-    // 3. B-only leftovers -> create fresh in A
-    if (sizeof(g_curB) > 0)
-        for i in 0:sizeof(g_curB)-1 do
-            createFreshBSDCopy(g_dlgProjB, g_dlgRootB, g_curB[i], g_dlgProjA, g_dlgRootA)
+    // 3. B-only leftovers -> create fresh in A, same relative folder
+    if (g_curBCount > 0)
+        for i in 0:g_curBCount-1 do
+            createFreshBSDCopy(g_dlgRootB, g_curFolderB[i], g_curNameB[i], g_dlgRootA)
 
     log("")
     log("Alignment run complete.")
     closeLog()
 }
 
+// Dialog cancelled (Cancel button or the window's own close box) - do
+// nothing further, just log and clean up.
 void cbCancelMapping(DB d)
 {
     hide(d)
@@ -674,77 +1025,160 @@ void cbCancelMapping(DB d)
 
 void showMappingDialog(Folder projA, string rootA, Folder projB, string rootB)
 {
-    g_dlgProjA = projA
     g_dlgRootA = rootA
-    g_dlgProjB = projB
     g_dlgRootB = rootB
 
-    string namesA[]
-    string namesB[]
-    collectBSDNames(projA, namesA)
-    collectBSDNames(projB, namesB)
+    // ---- 1. collect every BSD in each project, anywhere in the tree ----
 
-    string blank[]
-    g_mapNameA = blank
-    g_mapNameB = blank
+    string namesA[500]     // size must match MAX_BSDS
+    string foldersA[500]   // size must match MAX_BSDS
+    int namesACount = 0
+    collectBSDsRecursive(projA, rootA, namesA, foldersA, namesACount)
 
-    string remainA[]
-    string remainB[]
+    string namesB[500]     // size must match MAX_BSDS
+    string foldersB[500]   // size must match MAX_BSDS
+    int namesBCount = 0
+    collectBSDsRecursive(projB, rootB, namesB, foldersB, namesBCount)
+
+    // Reset all the mapping-dialog globals for this run (in case the
+    // script is somehow invoked more than once in the same session).
+    g_mapCount = 0
+    g_curACount = 0
+    g_curBCount = 0
+
+    // ---- 2. auto-pre-match BSDs that share both folder AND name ----
+
+    bool usedB[500]         // size must match MAX_BSDS; marks B-side
+                             // entries already claimed by an auto-match
+    int j
+    if (namesBCount > 0)
+        for j in 0:namesBCount-1 do
+            usedB[j] = false
 
     int i
-    if (sizeof(namesA) > 0)
+    if (namesACount > 0)
     {
-        for i in 0:sizeof(namesA)-1 do
+        for i in 0:namesACount-1 do
         {
-            if (arrayContains(namesB, namesA[i]))
+            int matchIdx = -1
+            if (namesBCount > 0)
             {
-                g_mapNameA[sizeof(g_mapNameA)] = namesA[i]
-                g_mapNameB[sizeof(g_mapNameB)] = namesA[i]
+                for j in 0:namesBCount-1 do
+                    if (!usedB[j] && namesB[j] == namesA[i] && foldersB[j] == foldersA[i])
+                        matchIdx = j
+            }
+
+            if (matchIdx >= 0)
+            {
+                // Exact folder+name match - pre-confirm this mapping.
+                usedB[matchIdx] = true
+                if (g_mapCount < MAX_BSDS)
+                {
+                    g_mapNameA[g_mapCount] = namesA[i]
+                    g_mapFolderA[g_mapCount] = foldersA[i]
+                    g_mapNameB[g_mapCount] = namesB[matchIdx]
+                    g_mapFolderB[g_mapCount] = foldersB[matchIdx]
+                    g_mapCount = g_mapCount + 1
+                }
+                else
+                    capacityWarning("confirmed mapping list", MAX_BSDS)
             }
             else
-                remainA[sizeof(remainA)] = namesA[i]
+            {
+                // No automatic match - leave it for the admin to map by hand.
+                if (g_curACount < MAX_BSDS)
+                {
+                    g_curNameA[g_curACount] = namesA[i]
+                    g_curFolderA[g_curACount] = foldersA[i]
+                    g_curA[g_curACount] = formatEntry(foldersA[i], namesA[i])
+                    g_curACount = g_curACount + 1
+                }
+                else
+                    capacityWarning("Project A unmapped BSD list", MAX_BSDS)
+            }
         }
     }
-    if (sizeof(namesB) > 0)
+
+    if (namesBCount > 0)
     {
-        for i in 0:sizeof(namesB)-1 do
-            if (!arrayContains(namesA, namesB[i]))
-                remainB[sizeof(remainB)] = namesB[i]
+        for j in 0:namesBCount-1 do
+        {
+            if (!usedB[j])
+            {
+                if (g_curBCount < MAX_BSDS)
+                {
+                    g_curNameB[g_curBCount] = namesB[j]
+                    g_curFolderB[g_curBCount] = foldersB[j]
+                    g_curB[g_curBCount] = formatEntry(foldersB[j], namesB[j])
+                    g_curBCount = g_curBCount + 1
+                }
+                else
+                    capacityWarning("Project B unmapped BSD list", MAX_BSDS)
+            }
+        }
     }
 
-    g_curA = remainA
-    g_curB = remainB
+    // ---- 3. build the initial display text for the mappings list ----
 
-    string initialMapDisplay[]
-    if (sizeof(g_mapNameA) > 0)
-        for i in 0:sizeof(g_mapNameA)-1 do
-            initialMapDisplay[sizeof(initialMapDisplay)] = g_mapNameA[i] " -> " g_mapNameB[i]
+    string initialMapDisplay[500]   // size must match MAX_BSDS
+    int initialMapDisplayCount = 0
+    if (g_mapCount > 0)
+    {
+        for i in 0:g_mapCount-1 do
+        {
+            initialMapDisplay[initialMapDisplayCount] =
+                formatEntry(g_mapFolderA[i], g_mapNameA[i]) " -> " formatEntry(g_mapFolderB[i], g_mapNameB[i])
+            initialMapDisplayCount = initialMapDisplayCount + 1
+        }
+    }
 
-    log("Baseline Set Definitions found - Project A: " sizeof(namesA) "   Project B: " sizeof(namesB))
-    log("Exact-name matches pre-mapped automatically: " sizeof(g_mapNameA))
+    log("Baseline Set Definitions found (all folders, recursively) - Project A: " namesACount
+        "   Project B: " namesBCount)
+    log("Exact folder+name matches pre-mapped automatically: " g_mapCount)
+
+    // ---- 4. build the dialog itself ----
+    //
+    // list() widgets are populated with insert() calls rather than by
+    // relying on whatever happens to be in the backing array at creation
+    // time - insert()/delete()/get() is the only list-content behaviour
+    // confirmed from working examples, so we lean on that exclusively.
+    // "placeholder" is just a throwaway 1-element array to satisfy each
+    // list() call's parameter; the real content is added right after via
+    // insert().
+
+    string placeholder[1]
 
     g_mapDlg = create("Map Baseline Set Definitions")
 
     label(g_mapDlg, "Project A: " rootA)
-    g_listA = list(g_mapDlg, "Unmapped Baseline Set Definitions in A", 10, remainA)
+    g_listA = list(g_mapDlg, "Unmapped Baseline Set Definitions in A (folder :: name)", 10, placeholder)
+    if (g_curACount > 0)
+        for i in 0:g_curACount-1 do
+            insert(g_listA, i, g_curA[i])
 
     label(g_mapDlg, "Project B: " rootB)
-    g_listB = list(g_mapDlg, "Unmapped Baseline Set Definitions in B", 10, remainB)
+    g_listB = list(g_mapDlg, "Unmapped Baseline Set Definitions in B (folder :: name)", 10, placeholder)
+    if (g_curBCount > 0)
+        for i in 0:g_curBCount-1 do
+            insert(g_listB, i, g_curB[i])
 
     apply(g_mapDlg, "Map Selected Pair ->", cbAddMapping)
     apply(g_mapDlg, "Remove Selected Mapping", cbRemoveMapping)
 
-    label(g_mapDlg, "Confirmed mappings (identical names were pre-matched automatically):")
-    g_listMap = list(g_mapDlg, "Confirmed mappings (A -> B)", 10, initialMapDisplay)
+    label(g_mapDlg, "Confirmed mappings (identical folder+name were pre-matched automatically):")
+    g_listMap = list(g_mapDlg, "Confirmed mappings (A -> B)", 10, placeholder)
+    if (initialMapDisplayCount > 0)
+        for i in 0:initialMapDisplayCount-1 do
+            insert(g_listMap, i, initialMapDisplay[i])
 
     g_status = field(g_mapDlg, "Status",
         "Select one BSD on each side, then click \"Map Selected Pair ->\". "
         "Anything left unmapped when you click \"Run Alignment\" will be "
-        "created fresh in the other project.", 70, false)
+        "created fresh on the other side, in the matching subfolder.", 70, false)
 
     ok(g_mapDlg, "Run Alignment", cbRunAlignment)
     ok(g_mapDlg, "Cancel", cbCancelMapping)
-    close(g_mapDlg, false, cbCancelMapping)
+    close(g_mapDlg, false, cbCancelMapping)   // window's own close box = Cancel
 
     show(g_mapDlg)
 }
@@ -781,8 +1215,8 @@ void main()
         return
     }
 
-    log("Total captured Baseline Sets right now - Project A: " countCapturedBaselineSets(projA)
-        "   Project B: " countCapturedBaselineSets(projB))
+    log("Total captured Baseline Sets right now (all folders, recursively) - Project A: "
+        countCapturedBaselineSetsRecursive(projA) "   Project B: " countCapturedBaselineSetsRecursive(projB))
 
     if (APPLY_CHANGES)
     {
